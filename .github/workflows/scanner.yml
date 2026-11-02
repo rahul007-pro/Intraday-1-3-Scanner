@@ -1,1 +1,108 @@
+name: Intraday Scanner
 
+# ============================================================
+#  FREE forever on a PUBLIC repo (unlimited Actions minutes).
+#  Private repo? See CLOUD_SETUP.md section 8 — change the two
+#  cron lines to */15 to stay inside the 2,000 free minutes.
+#
+#  All cron times are UTC. IST = UTC+5:30 (no daylight saving).
+#    09:30-15:29 IST  =  04:00-09:59 UTC   scan cycles
+#    15:35 IST        =  10:05 UTC         end-of-day journal finalization
+# ============================================================
+
+on:
+  schedule:
+    - cron: '*/5 4-9 * * 1-5'    # every 5 min, Mon-Fri, 09:30-15:29 IST
+    - cron: '5 10 * * 1-5'       # Mon-Fri 15:35 IST - final journal verdict
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'scan = one scan cycle | eod = finalize journal + report'
+        required: true
+        default: 'scan'
+        type: choice
+        options:
+          - scan
+          - eod
+
+permissions:
+  contents: write                # allow the workflow to commit the journal
+
+concurrency:
+  group: scanner                 # never two scanner runs overlapping;
+  cancel-in-progress: false      # extra runs queue up instead
+
+jobs:
+  scan:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule != '5 10 * * 1-5')
+      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'scan')
+    name: Scan cycle + journal
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build config.json from Secrets
+        env:
+          SCANNER_CAPITAL: ${{ secrets.SCANNER_CAPITAL }}
+          SCANNER_RISK_PCT: ${{ secrets.SCANNER_RISK_PCT }}
+          SCANNER_RISK_RR: ${{ secrets.SCANNER_RISK_RR }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATA_MODE: ${{ secrets.DATA_MODE }}
+        run: python make_config.py
+
+      - name: One scan cycle (journal catches up automatically)
+        run: python scanner.py --once
+
+      - name: Commit journal back to the repo
+        run: bash .github/scripts/commit_journal.sh
+
+  eod:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '5 10 * * 1-5')
+      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'eod')
+    name: End-of-day journal verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build config.json from Secrets
+        env:
+          SCANNER_CAPITAL: ${{ secrets.SCANNER_CAPITAL }}
+          SCANNER_RISK_PCT: ${{ secrets.SCANNER_RISK_PCT }}
+          SCANNER_RISK_RR: ${{ secrets.SCANNER_RISK_RR }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATA_MODE: ${{ secrets.DATA_MODE }}
+        run: python make_config.py
+
+      - name: Finalize journal (back-fill outcomes, refresh day verdict)
+        run: python journal.py
+
+      - name: Commit journal back to the repo
+        run: bash .github/scripts/commit_journal.sh
