@@ -1,0 +1,107 @@
+# NIFTY 100 scan universe - one NSE symbol per line, '#' starts a comment.
+# Scanner strips '.NS' internally and re-attaches it for Yahoo Finance.
+# --- NIFTY 50 ---
+RELIANCE.NS        # Reliance Industries
+HDFCBANK.NS        # HDFC Bank
+ICICIBANK.NS       # ICICI Bank
+INFY.NS            # Infosys
+TCS.NS             # Tata Consultancy Services
+BHARTIARTL.NS      # Bharti Airtel
+ITC.NS             # ITC
+LT.NS              # Larsen & Toubro
+KOTAKBANK.NS       # Kotak Mahindra Bank
+SBIN.NS            # State Bank of India
+AXISBANK.NS        # Axis Bank
+M&M.NS             # Mahindra & Mahindra
+MARUTI.NS          # Maruti Suzuki
+SUNPHARMA.NS       # Sun Pharmaceutical
+TMPV.NS            # Tata Motors Passenger Vehicles (post-demerger)
+TATASTEEL.NS       # Tata Steel
+TITAN.NS           # Titan Company
+ULTRACEMCO.NS      # UltraTech Cement
+ASIANPAINT.NS      # Asian Paints
+BAJFINANCE.NS      # Bajaj Finance
+BAJAJFINSV.NS      # Bajaj Finserv
+BAJAJ-AUTO.NS      # Bajaj Auto
+HCLTECH.NS         # HCL Technologies
+WIPRO.NS           # Wipro
+TECHM.NS           # Tech Mahindra
+NESTLEIND.NS       # Nestle India
+HINDUNILVR.NS      # Hindustan Unilever
+POWERGRID.NS       # Power Grid Corporation
+NTPC.NS            # NTPC
+ONGC.NS            # Oil & Natural Gas Corporation
+COALINDIA.NS       # Coal India
+ADANIENT.NS        # Adani Enterprises
+ADANIPORTS.NS      # Adani Ports & SEZ
+APOLLOHOSP.NS      # Apollo Hospitals
+CIPLA.NS           # Cipla
+DRREDDY.NS         # Dr Reddy's Laboratories
+EICHERMOT.NS       # Eicher Motors
+GRASIM.NS          # Grasim Industries
+HINDALCO.NS        # Hindalco Industries
+HDFCLIFE.NS        # HDFC Life Insurance
+SBILIFE.NS         # SBI Life Insurance
+INDUSINDBK.NS      # IndusInd Bank
+BEL.NS             # Bharat Electronics
+TRENT.NS           # Trent
+JIOFIN.NS          # Jio Financial Services
+SHRIRAMFIN.NS      # Shriram Finance
+TATACONSUM.NS      # Tata Consumer Products
+JSWSTEEL.NS        # JSW Steel
+HEROMOTOCO.NS      # Hero MotoCorp
+ETERNAL.NS         # Eternal (Zomato)
+# --- NIFTY NEXT 50 ---
+ADANIENSOL.NS      # Adani Energy Solutions
+ADANIGREEN.NS      # Adani Green Energy
+ADANIPOWER.NS      # Adani Power
+AMBUJACEM.NS       # Ambuja Cements
+ABB.NS             # ABB India
+BAJAJHLDNG.NS      # Bajaj Holdings
+BANKBARODA.NS      # Bank of Baroda
+BPCL.NS            # Bharat Petroleum
+BOSCHLTD.NS        # Bosch
+BRITANNIA.NS       # Britannia Industries
+CANBK.NS           # Canara Bank
+CHOLAFIN.NS        # Cholamandalam Investment
+DABUR.NS           # Dabur India
+DIVISLAB.NS        # Divi's Laboratories
+DLF.NS             # DLF
+DMART.NS           # Avenue Supermarts (DMart)
+GAIL.NS            # GAIL (India)
+GODREJCP.NS        # Godrej Consumer Products
+HAVELLS.NS         # Havells India
+HAL.NS             # Hindustan Aeronautics
+ICICIGI.NS         # ICICI Lombard General Insurance
+ICICIPRULI.NS      # ICICI Prudential Life Insurance
+INDHOTEL.NS        # Indian Hotels Company
+IOC.NS             # Indian Oil Corporation
+INDIGO.NS          # InterGlobe Aviation (IndiGo)
+IRFC.NS            # Indian Railway Finance Corporation
+JINDALSTEL.NS      # Jindal Steel & Power
+JSWENERGY.NS       # JSW Energy
+LICI.NS            # Life Insurance Corporation
+LODHA.NS           # Macrotech Developers (Lodha)
+LTM.NS             # LTIMindtree (NSE code changed from LTIM)
+MANKIND.NS         # Mankind Pharma
+MARICO.NS          # Marico
+MOTHERSON.NS       # Samvardhana Motherson
+NAUKRI.NS          # Info Edge (Naukri)
+PIDILITIND.NS      # Pidilite Industries (Fevicol)
+PFC.NS             # Power Finance Corporation
+PNB.NS             # Punjab National Bank
+RECLTD.NS          # REC
+SHREECEM.NS        # Shree Cement
+SIEMENS.NS         # Siemens India
+SRF.NS             # SRF
+TATACOMM.NS        # Tata Communications
+TATAPOWER.NS       # Tata Power
+TORNTPHARM.NS      # Torrent Pharmaceuticals
+TVSMOTOR.NS        # TVS Motor Company
+UNITDSPR.NS        # United Spirits
+VBL.NS             # Varun Beverages
+VEDL.NS            # Vedanta
+ZYDUSLIFE.NS       # Zydus Lifesciences
+# Note: index membership changes periodically - refresh this list when NSE
+# announces NIFTY 100 rebalancing. Unknown/renamed symbols are skipped
+# gracefully by the scanner.

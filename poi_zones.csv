@@ -1,0 +1,28 @@
+# ============================================================================
+# Strategy 3 - H4 Point-of-Interest zones (SOP 3.3, Step 3) - OPTIONAL
+#
+# Since v3.1 the scanner marks zones FOR you: every morning the AutoPoi
+# engine writes poi_zones_auto.csv (H4 supply/demand from Yahoo 1h
+# history, fresh-only, W1/D1-bias aligned). You do NOT need this file
+# anymore. Anything you add here is merged ON TOP of the automatic map -
+# use it only to force a zone the machine did not pick.
+#
+# Columns: symbol,side,zone_low,zone_high[,date]
+#   symbol    NSE symbol (must be in universe_nifty100.txt)
+#   side      LONG  = demand zone (buy the reaction up)
+#             SHORT = supply zone (sell the reaction down)
+#   zone_low  lower price edge of the H4 zone
+#   zone_high upper price edge of the H4 zone
+#   date      optional - leave empty for a standing zone, or set YYYY-MM-DD
+#             to restrict the zone to one trading day
+#
+# Example (remove the leading '#' to activate):
+# RELIANCE,LONG,1285.00,1298.50,2026-10-22
+# HDFCBANK,SHORT,1712.00,1725.00
+#
+# Rules (from the SOP):
+#   * NEVER trade floating price - only marked zones are tradable.
+#   * W1 and D1 bias must agree; the scanner computes this itself and
+#     skips Strategy 3 on symbols where the timeframes disagree.
+#   * If two zones apply, the scanner uses the first one price taps.
+# ============================================================================

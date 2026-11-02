@@ -1,0 +1,2944 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+ INTRADAY SCANNER v3.1 - ALL THREE SOP STRATEGIES, FULLY AUTOMATED
+ (AUTO-POI FOR STRATEGY 3) + 15:10 AUTO SQUARE-OFF + SELF-UPDATING JOURNAL
+===============================================================================
+Companion tool to the "Top 3 Intraday Strategies & Scanners SOP (Rev 2.x)".
+
+WHAT IT DOES
+------------
+1. Scans NIFTY 100 stocks every 5 minutes and evaluates ALL THREE SOP
+   strategies on closed 5-minute bars:
+   S1  Fibonacci Extension Continuation (SOP 3.1, Types 01/02/03):
+       A-B-C impulse + pullback structure, activation close beyond Fib
+       Extension Level 1, golden-pocket / 0.236 zone watch, 2R+1G (long)
+       or 2G+1R (short) trigger, buy/sell stop beyond the green/red candle,
+       5-bar trigger expiry, noise filter on the green candle range.
+   S2  NSE Momentum + Volume Breakout (SOP 3.2, Table 7, verbatim):
+       close beyond prior 3-bar high/low + VWAP side + EMA9/EMA20 + RSI(14)
+       55/45 + 1.5x 20-bar volume surge with a 100k-share floor + close in
+       the top/bottom 25% of the signal bar + Rs 50-2000 band + minimum
+       stop = max(0.30% of entry, 1.5 x ATR14). Entry = signal high/low
+       +/- one tick (stop order), SL beyond the signal bar, 1:3 target.
+   S3  Five-Timeframe CHoCH (SOP 3.3): H4 POI zones are marked FOR you by
+       the AutoPoi engine every morning (supply = swing highs, demand =
+       swing lows on H4, fresh-only, near price) - no manual zone entry
+       needed. Optional manual overrides in poi_zones.csv are merged in.
+       W1/D1 bias computed from daily closes (must agree), H1 confirmation
+       (engulfing / pin bar / CHoCH close), M15 close in direction, stop
+       one tick beyond the POI extreme, target = nearest opposing POI if
+       >= 2R else fixed 3R.
+2. Sizes every confirmed signal to the SOP risk model (0.25% capital risk,
+   1:3 fixed reward:risk) and enforces SOP 3.4 discipline: max 2 concurrent
+   positions, max 3 entries/day, one position per instrument.
+3. AUTOMATED SQUARE-OFF: the loop stops scanning at 15:10 IST, every OPEN
+   trade in the journal is squared off with the freshest available price,
+   day verdicts are refreshed, the final report is printed and the console
+   closes. A 15:05 heads-up alert is sent first (Telegram/console).
+4. ALERTS ONLY. It never places orders. Verify every signal in your broker
+   terminal and pass the SOP 12-point checklist before acting.
+
+WHAT IS NEW IN v3.1 (vs v3.0)
+-----------------------------
+* STRATEGY 3 IS NOW FULLY AUTOMATED: the new AutoPoi engine builds the
+  H4 supply/demand zone map itself every morning from Yahoo 1-hour
+  history (two H4 candles per NSE session: 09:15-13:15, 13:15-15:30),
+  keeps only fresh zones (never closed through), within +/-6% of the
+  last close, and writes poi_zones_auto.csv. Zones carry today's date
+  and expire at midnight - a brand-new map is generated next session.
+  Your manual poi_zones.csv (if you fill it) is merged on top, so you
+  can still force a zone the machine did not pick.
+* Morning Telegram summary now lists how many auto zones survived the
+  W1/D1 bias alignment, so you know Strategy 3's watchlist before 09:30.
+
+WHAT IS NEW IN v3.0 (vs v2.2.1)
+-------------------------------
+* Strategy 2 rebuilt to match SOP Table 7 exactly (3-bar breakout, EMA9/20,
+  RSI gate, 1.5x volume + 100k shares, bar-range close, Rs 2000 cap,
+  ATR minimum stop, stop-order entry at signal high/low + 1 tick).
+* Strategy 1 (Fibonacci Extension Continuation, Types 01/02/03) implemented.
+* Strategy 3 (Five-Timeframe CHoCH) implemented - reads poi_zones.csv,
+  computes W1/D1 bias itself, watches H1 + M15 confirmation at your zones.
+* 15:10 square-off hardened: history-based finalize + fresh-bar fallback,
+  15:05 warning alert, weekend exit, --once EOD guard for cloud runs.
+
+USAGE
+-----
+  python scanner.py                 continuous 5-minute scanning loop
+  python scanner.py --once          run a single scan cycle and exit
+  python scanner.py --journal       update journal + print report, no scan
+  python scanner.py --selftest      run the built-in test suite
+  python journal.py                 standalone journal updater/reporter
+
+DISCLAIMER: educational tooling only, not investment advice. Trading intraday
+equities carries a high risk of loss. You are the risk manager; this script
+only watches prices and keeps your logbook.
+===============================================================================
+"""
+
+import os
+import sys
+import csv
+import json
+import math
+import time
+import argparse
+import traceback
+import urllib.parse
+import urllib.request
+from collections import namedtuple
+from datetime import datetime, timedelta, time as dtime, timezone
+
+VERSION = "3.1.0"
+
+# ---------------------------------------------------------------------------
+# Time zone: Indian Standard Time is UTC+05:30 year-round (no DST), so a fixed
+# offset is the most portable choice (works on Windows without tzdata).
+# ---------------------------------------------------------------------------
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist():
+    return datetime.now(IST)
+
+
+def parse_hhmm(s):
+    h, m = str(s).strip().split(":")
+    return dtime(int(h), int(m))
+
+
+def fmt2(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
+
+
+def _hhmm(dt):
+    return dt.strftime("%H:%M")
+
+
+def round_tick(price, mode="nearest", tick=0.05):
+    """Round to the NSE tick size (Rs 0.05)."""
+    n = price / tick
+    if mode == "down":
+        v = math.floor(n + 1e-9)
+    elif mode == "up":
+        v = math.ceil(n - 1e-9)
+    else:
+        v = round(n)
+    return round(v * tick, 2)
+
+
+# ---------------------------------------------------------------------------
+# Default configuration. Anything the user omits in config.json is merged
+# from here, so the journal works out of the box even with an old config.
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "data_mode": "auto",              # auto | nse | yahoo
+    "universe_file": "universe_nifty100.txt",
+    "scan_interval_min": 5,
+    "rotate_slice": 25,               # NSE mode: bar-check N extra symbols/cycle
+    "scan_start": "09:30",            # no signals before this (IST)
+    "entry_cutoff": "13:30",          # SOP: no new entries after 13:30
+    "squareoff": "15:10",             # SOP: intraday square-off time
+    "squareoff_alert": "15:05",       # heads-up alert before square-off
+    "exit_after": "15:35",            # hard loop-exit safety net
+    "auto_exit_after_close": True,    # close the console after EOD processing
+    "capital": 25000,                 # Rs - trading capital
+    "risk_pct": 0.25,                 # Phase V risk per trade (% of capital)
+    "rr": 3.0,                        # fixed reward:risk (Phase V = 1:3 only)
+    "cost_rt": 50.0,                  # SOP App.B: est. round-trip cost (Rs)
+    "sl_buffer_pct": 0.10,            # legacy; SOP 1-tick buffer is used now
+    "max_stop_pct": 1.5,              # skip setups whose stop is wider (%)
+    "min_bars": 15,                   # 5m bars required before any signal
+    "min_price": 50,                  # S2 universe band floor (Rs)
+    "max_price": 2000,                # S2 universe band cap (Rs)
+    "min_turnover": 10000000,         # data-quality: day turnover >= 1 crore
+    "min_range_pct": 0.40,            # data-quality: day range >= 0.4%
+    # ---- Strategy 2: NSE Momentum + Volume Breakout (SOP 3.2, Table 7) ----
+    "breakout_bars": 3,               # close beyond prior N-bar high/low
+    "vol_avg_bars": 20,               # volume surge baseline
+    "rvol_mult": 1.5,                 # bar vol >= 1.5x 20-bar average
+    "min_bar_volume": 100000,         # ...and >= 100k shares
+    "ema_fast": 9,                    # EMA9 above (long) / below (short) EMA20
+    "ema_slow": 20,
+    "rsi_period": 14,
+    "rsi_long": 55,                   # RSI(14) > 55 for longs
+    "rsi_short": 45,                  # RSI(14) < 45 for shorts
+    "close_extreme_pct": 25,          # close in top/bottom 25% of BAR range
+    "min_stop_pct": 0.30,             # min stop = max(0.30% of entry, 1.5xATR)
+    "atr_stop_mult": 1.5,
+    # ---- Strategy 1: Fibonacci Extension Continuation (SOP 3.1) ----
+    "s1_enabled": True,
+    "impulse_min_pct": 0.5,           # min A->B impulse leg size (% of A)
+    "fib_tol_pct": 0.2,               # zone tolerance (% of price)
+    "trigger_expiry_bars": 5,         # green-high break window (SOP: 5 bars)
+    "green_min_range_pct": 0.30,      # skip noise-dominated green candles
+    # ---- Strategy 3: Five-Timeframe CHoCH (SOP 3.3) ----
+    "s3_enabled": True,
+    "poi_file": "poi_zones.csv",      # OPTIONAL manual zone overrides
+    "s3_auto_poi": True,              # auto-mark H4 POI zones each morning
+    "poi_auto_file": "poi_zones_auto.csv",
+    "s3_poi_hist_period": "60d",      # 1h history window for detection
+    "s3_poi_lookback_days": 30,       # scan the last N sessions of H4
+    "s3_poi_max_zone_pct": 2.0,       # drop zones taller than this %
+    "s3_poi_proximity_pct": 6.0,      # only zones within +/-X% of price
+    "s3_poi_max_per_side": 2,         # nearest N fresh zones per side
+    # ---- SOP 3.4 / Phase V discipline caps ----
+    "max_concurrent_positions": 2,    # never hold more than 2 positions
+    "max_trades_per_day": 3,          # three-entry cap (Phase V doctrine)
+    "telegram": {"bot_token": "", "chat_id": ""},
+    "journal": {
+        "folder": "journal",
+        "daily_loss_limit_R": -2.0,   # circuit breaker: day loss limit (R)
+        "daily_loss_limit_amt": 0,    # optional Rs limit (0 = disabled)
+        "max_consecutive_losses": 2   # circuit breaker: loss streak
+    }
+}
+
+
+def deep_merge(base, override):
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+CURRENT_CFG = None  # set by load_config(); used by send_telegram()
+
+
+def load_config(path="config.json"):
+    global CURRENT_CFG
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            cfg = deep_merge(DEFAULT_CONFIG, user)
+        except Exception as e:
+            print(f"[CONFIG] could not parse {path} ({e}); using defaults")
+    # sanity
+    cfg["scan_start_t"] = parse_hhmm(cfg["scan_start"])
+    cfg["entry_cutoff_t"] = parse_hhmm(cfg["entry_cutoff"])
+    cfg["squareoff_t"] = parse_hhmm(cfg["squareoff"])
+    cfg["squareoff_alert_t"] = parse_hhmm(cfg.get("squareoff_alert", "15:05"))
+    cfg["exit_after_t"] = parse_hhmm(cfg.get("exit_after", "15:35"))
+    if cfg["rr"] <= 0:
+        cfg["rr"] = 3.0
+    CURRENT_CFG = cfg
+    return cfg
+
+
+def send_telegram(text):
+    """Fire-and-forget Telegram message. Never raises."""
+    cfg = CURRENT_CFG or {}
+    tg = (cfg.get("telegram") or {})
+    token, chat = tg.get("bot_token", ""), tg.get("chat_id", "")
+    if not token or not chat:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print(f"[TG] telegram send failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Market data primitives
+# ---------------------------------------------------------------------------
+Bar = namedtuple("Bar", "ts open high low close volume")
+
+
+def load_universe(path):
+    """One symbol per line, '#' comments allowed. Returns NSE symbols
+    (suffix .NS stripped; Yahoo calls re-attach it)."""
+    syms = []
+    if not os.path.exists(path):
+        print(f"[WARN] universe file '{path}' not found")
+        return syms
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.split("#")[0].strip().upper()
+            if not s:
+                continue
+            if s.endswith(".NS"):
+                s = s[: -len(".NS")]
+            if s not in syms:
+                syms.append(s)
+    return syms
+
+
+def ema_series(values, period):
+    """Recursive EMA (adjust=False style). Always defined from bar 1, which
+    keeps the EMA comparisons usable through the morning session."""
+    if not values:
+        return []
+    k = 2.0 / (period + 1.0)
+    out = [float(values[0])]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1.0 - k))
+    return out
+
+
+def vwap_series(bars):
+    out, pv, vv = [], 0.0, 0.0
+    for b in bars:
+        tp = (b.high + b.low + b.close) / 3.0
+        v = b.volume or 0
+        pv += tp * v
+        vv += v
+        out.append(pv / vv if vv > 0 else b.close)
+    return out
+
+
+def rsi_series(values, period=14):
+    """Wilder's RSI. Entries before the seed window are None."""
+    n = len(values)
+    if n < period + 1:
+        return [None] * n
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        d = values[i] - values[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / period, losses / period
+    out = [None] * period
+    if al == 0:
+        out.append(100.0 if ag > 0 else 50.0)
+    else:
+        out.append(100.0 - 100.0 / (1.0 + ag / al))
+    for i in range(period + 1, n):
+        d = values[i] - values[i - 1]
+        ag = (ag * (period - 1) + max(d, 0.0)) / period
+        al = (al * (period - 1) + max(-d, 0.0)) / period
+        if al == 0:
+            out.append(100.0 if ag > 0 else 50.0)
+        else:
+            out.append(100.0 - 100.0 / (1.0 + ag / al))
+    return out
+
+
+def atr_series(bars, period=14):
+    """Wilder's ATR. Entries before the seed window are None."""
+    n = len(bars)
+    if n < 2:
+        return [None] * n
+    trs = []
+    for i, b in enumerate(bars):
+        if i == 0:
+            trs.append(b.high - b.low)
+        else:
+            pc = bars[i - 1].close
+            trs.append(max(b.high - b.low, abs(b.high - pc), abs(b.low - pc)))
+    if n < period + 1:
+        return [None] * n
+    a = sum(trs[:period]) / period
+    out = [None] * (period - 1) + [a]
+    for i in range(period, n):
+        a = (a * (period - 1) + trs[i]) / period
+        out.append(a)
+    return out
+
+
+def pivot_points_on_values(vals, k=2):
+    """Fractal pivots on a plain value series: index i is a pivot high if
+    vals[i] > the k values to its right (and >= the values to its left),
+    so a pivot is confirmed exactly k bars after the extreme. The first
+    k bars of the series get edge treatment (partial left window), which
+    keeps the day's opening swing detectable. Returns
+    ([(idx, val)...], [(idx, val)...])."""
+    highs, lows = [], []
+    n = len(vals)
+    for i in range(n - k):
+        right = vals[i + 1:i + k + 1]
+        left = vals[max(0, i - k):i]
+        if vals[i] > max(right) and (not left or vals[i] >= max(left)):
+            highs.append((i, vals[i]))
+        if vals[i] < min(right) and (not left or vals[i] <= min(left)):
+            lows.append((i, vals[i]))
+    return highs, lows
+
+
+def pivot_points(bars, k=2):
+    """Fractal pivots on OHLC bars: (pivot_highs, pivot_lows) as
+    ([(idx, high)...], [(idx, low)...])."""
+    hh, _ = pivot_points_on_values([b.high for b in bars], k)
+    _, ll = pivot_points_on_values([b.low for b in bars], k)
+    return hh, ll
+
+
+# ===========================================================================
+# SIGNAL OBJECT + STRATEGY 2 (SOP 3.2 Table 7, verbatim)
+# ===========================================================================
+class Signal:
+    def __init__(self, symbol, direction, date, sig_time, entry, stop, target,
+                 qty, risk_ps, risk_amt, reward_amt, note="", setup=None):
+        self.symbol = symbol
+        self.direction = direction          # LONG | SHORT
+        self.setup = setup or ("S2_BREAKOUT" if direction == "LONG"
+                               else "S2_BREAKDOWN")
+        self.date = date                    # YYYY-MM-DD (IST)
+        self.sig_time = sig_time            # HH:MM (IST)
+        self.entry = entry
+        self.stop = stop
+        self.target = target
+        self.qty = qty
+        self.risk_ps = risk_ps
+        self.risk_amt = risk_amt
+        self.reward_amt = reward_amt
+        self.note = note
+
+    @property
+    def trade_id(self):
+        return f"{self.date.replace('-', '')}-{self.symbol}-{self.direction}"
+
+
+def _size_and_check(symbol, direction, entry, stop, bar, cfg, setup, note):
+    """Shared sizing + SOP 4.1 guards (all three strategies).
+    Returns a Signal or None."""
+    risk_ps = (entry - stop) if direction == "LONG" else (stop - entry)
+    if risk_ps <= 0 or risk_ps / entry > float(cfg["max_stop_pct"]) / 100.0:
+        return None
+    risk_amt = float(cfg["capital"]) * float(cfg["risk_pct"]) / 100.0
+    qty = int(risk_amt // risk_ps)
+    if qty < 1:
+        return None
+    if direction == "LONG":
+        target = round_tick(entry + float(cfg["rr"]) * risk_ps, "nearest")
+    else:
+        target = round_tick(entry - float(cfg["rr"]) * risk_ps, "nearest")
+    reward_amt = abs(target - entry) * qty
+    # SOP 4.1 Step 4 - capital-price rejection (qty is never cut to fit):
+    if entry * qty > float(cfg["capital"]):
+        return None
+    # SOP 4.1 Step 5 - cost hurdle: 3R value must beat cost + Rs 50
+    if reward_amt < float(cfg.get("cost_rt", 50.0)) + 50.0:
+        return None
+    return Signal(symbol, direction, bar.ts.date().isoformat(),
+                  _hhmm(bar.ts), round(entry, 2), round(stop, 2),
+                  round(target, 2), qty, round(risk_ps, 2),
+                  round(risk_amt, 2), round(reward_amt, 2), note, setup)
+
+
+def check_s2(symbol, bars, cfg):
+    """Strategy 2 - NSE Momentum plus Volume Breakout (SOP 3.2, Table 7).
+    Long form; shorts are a full mirror. Returns a Signal (setup
+    S2_BREAKOUT / S2_BREAKDOWN) or None. All gates must pass."""
+    n = len(bars)
+    va = int(cfg["vol_avg_bars"])
+    bb = int(cfg["breakout_bars"])
+    rp = int(cfg["rsi_period"])
+    need = max(int(cfg["min_bars"]), va + 2, rp + 2, bb + 2)
+    if n < need:
+        return None
+    bar = bars[-1]
+    t = bar.ts.time()
+    if t < cfg["scan_start_t"] or t > cfg["entry_cutoff_t"]:
+        return None
+    if not bar.volume or not bar.close or bar.close <= 0 or bar.high <= bar.low:
+        return None
+
+    closes = [b.close for b in bars]
+    vols = [b.volume or 0 for b in bars]
+
+    # shared data-quality gates (unchanged from v2.2: staleness + turnover)
+    day_high = max(b.high for b in bars)
+    day_low = min(b.low for b in bars)
+    if (day_high - day_low) / bar.close * 100.0 < float(cfg["min_range_pct"]):
+        return None
+    if bar.close * sum(vols) < float(cfg["min_turnover"]):
+        return None
+
+    # Universe filter: Rs 50 - Rs 2,000 (Table 7, row 6)
+    if not (float(cfg["min_price"]) <= bar.close <= float(cfg["max_price"])):
+        return None
+
+    # Trend: VWAP side + EMA alignment (row 1)
+    vwap = vwap_series(bars)[-1]
+    e_fast = ema_series(closes, int(cfg["ema_fast"]))[-1]
+    e_slow = ema_series(closes, int(cfg["ema_slow"]))[-1]
+
+    # Momentum context: RSI(14) (row 2)
+    rsi = rsi_series(closes, rp)[-1]
+    if rsi is None:
+        return None
+
+    # Breakout: close beyond the prior 3-bar high/low (row 3)
+    bh = max(b.high for b in bars[-(bb + 1):-1])
+    bl = min(b.low for b in bars[-(bb + 1):-1])
+
+    # Volume surge: 1.5x the 20-bar average AND >= 100k shares (row 4)
+    base = sum(vols[-(va + 1):-1]) / va
+    rvol = (bar.volume / base) if base > 0 else 0.0
+
+    # Candle quality: bullish/bearish + close in the top/bottom 25% of the
+    # signal bar's own high-low range (row 5)
+    close_pos = (bar.close - bar.low) / (bar.high - bar.low)
+
+    long_sig = (bar.close > vwap and e_fast > e_slow and rsi > float(cfg["rsi_long"])
+                and bar.close > bh and bar.close > bar.open
+                and rvol >= float(cfg["rvol_mult"])
+                and bar.volume >= int(cfg["min_bar_volume"])
+                and close_pos >= 1.0 - float(cfg["close_extreme_pct"]) / 100.0)
+    short_sig = (bar.close < vwap and e_fast < e_slow and rsi < float(cfg["rsi_short"])
+                 and bar.close < bl and bar.close < bar.open
+                 and rvol >= float(cfg["rvol_mult"])
+                 and bar.volume >= int(cfg["min_bar_volume"])
+                 and close_pos <= float(cfg["close_extreme_pct"]) / 100.0)
+    direction = "LONG" if long_sig else ("SHORT" if short_sig else None)
+    if direction is None:
+        return None
+
+    # Entry/stop as SOP stop orders: signal high + 1 tick (buy stop) or
+    # signal low - 1 tick (sell stop); SL one tick beyond the other extreme.
+    if direction == "LONG":
+        entry = round_tick(bar.high + 0.05, "up")
+        stop = round_tick(bar.low - 0.05, "down")
+    else:
+        entry = round_tick(bar.low - 0.05, "down")
+        stop = round_tick(bar.high + 0.05, "up")
+
+    # Minimum stop gate (Table 7, row 7): >= max(0.30% of entry, 1.5xATR14)
+    atr = atr_series(bars, rp)[-1]
+    if atr is None:
+        return None
+    floor = max(float(cfg["min_stop_pct"]) / 100.0 * entry,
+                float(cfg["atr_stop_mult"]) * atr)
+    risk_now = (entry - stop) if direction == "LONG" else (stop - entry)
+    if risk_now < floor:
+        return None
+
+    setup = "S2_BREAKOUT" if direction == "LONG" else "S2_BREAKDOWN"
+    note = f"S2 3bar-brk rvol{rvol:.1f}x rsi{rsi:.0f}"
+    return _size_and_check(symbol, direction, entry, stop, bar, cfg, setup, note)
+
+
+# Back-compat alias (older callers / tests).
+check_signal = check_s2
+
+
+# ===========================================================================
+# STRATEGY 1 - FIBONACCI EXTENSION CONTINUATION (SOP 3.1, Types 01/02/03)
+# ===========================================================================
+class FibEngine:
+    """Strategy 1 - Fibonacci Extension Continuation (long form; shorts are
+    a full mirror analysed on price-inverted bars).
+
+    Per-side flow (SOP 3.1):
+      1. Locate the latest A-B-C structure from 5m fractal pivots:
+         A = pivot low, B = pivot high (impulse leg >= impulse_min_pct%),
+         C = pullback pivot low.  Fib Extension Level 1 = C + (B - A),
+         the 100% projection of A-B measured from C.
+      2. ACTIVATION: a 5m CLOSE above Level 1 (wicks do not count), with
+         the context gate: close above VWAP and EMA-20 rising.
+      3. ZONE:
+         Type 01 - first confirmed swing high B2 after the activation;
+                   golden pocket = 0.5-0.618 retracement of C->B2.
+         Type 02 - if price first extends to the 1.618 projection, the
+                   golden pocket of C->extreme instead.
+         Type 03 - Mother Fib = day's primary opening impulse (first
+                   pivot low -> first pivot high -> first pullback low);
+                   arms when price returns directly to the 0.236 level.
+      4. TRIGGER: two consecutive red candles that dip into the zone and
+         stay inside it, then a green candle closing inside the zone
+         (2R+1G). Skip if the green range < 0.30% of its close (noise).
+      5. ENTRY: the signal fires when a later bar trades through the buy
+         stop = green high + 1 tick (within trigger_expiry_bars, else the
+         setup is void). SL = green low - 1 tick; target = 1:3.
+
+    The analysis is a deterministic replay of the full day's bars on every
+    cycle (restart-safe, no hidden state). After a zone fails or the
+    trigger expires, the side is dead for the day (SOP: wait for a fresh
+    activation - conservative, zero-cost missed trades).
+    """
+
+    K = 2  # pivot strength (bars each side)
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.watch = set()   # {(symbol, side)} with a live setup
+
+    def update(self, symbol, bars):
+        """Re-analyse the full day's 5m bars. Returns a Signal or None."""
+        sig = self._analyze(symbol, bars, "LONG")
+        if sig is None:
+            sig = self._analyze(symbol, bars, "SHORT")
+        return sig
+
+    def _inv(self, bars):
+        return [Bar(b.ts, -b.open, -b.high, -b.low, -b.close, b.volume)
+                for b in bars]
+
+    def _analyze(self, symbol, bars, side):
+        cfg = self.cfg
+        key = (symbol, side)
+        n = len(bars)
+        if n < max(int(cfg["min_bars"]), 10):
+            self.watch.discard(key)
+            return None
+        if side == "SHORT":
+            bars = self._inv(bars)
+        closes = [b.close for b in bars]
+        vols = [b.volume or 0 for b in bars]
+
+        # shared data-quality gates
+        day_high = max(b.high for b in bars)
+        day_low = min(b.low for b in bars)
+        if day_high <= day_low:
+            return None
+        if (day_high - day_low) / bars[-1].close * 100.0 < float(cfg["min_range_pct"]):
+            self.watch.discard(key)
+            return None
+        if bars[-1].close * sum(vols) < float(cfg["min_turnover"]):
+            self.watch.discard(key)
+            return None
+
+        ph, pl = pivot_points(bars, self.K)
+        e20 = ema_series(closes, 20)
+        # ---- 1+2. latest A-B-C whose Level 1 was ACTUALLY closed above ---
+        # (newer swing structures without an activation are skipped, so the
+        # golden-pocket pullback of a live setup cannot hijack the picker)
+        chosen = None
+        for bi in range(len(ph) - 1, -1, -1):
+            b_i, b_px = ph[bi]
+            lows_before = [p for p in pl if p[0] < b_i]
+            lows_after = [p for p in pl if p[0] > b_i]
+            if not lows_before or not lows_after:
+                continue
+            a_i, a_px = lows_before[-1]
+            c_i, c_px = lows_after[0]
+            leg = b_px - a_px
+            if a_px <= 0 or leg <= 0:
+                continue
+            if leg / a_px * 100.0 < float(cfg["impulse_min_pct"]):
+                continue
+            if c_px <= a_px or b_px <= c_px:
+                continue
+            L1 = c_px + leg
+            act_i = None
+            for i in range(c_i + 1, n):
+                if bars[i].close > L1:
+                    act_i = i
+                    break
+            if act_i is None:
+                continue        # Level 1 never closed above - try older leg
+            vwap_act = vwap_series(bars[:act_i + 1])[-1]
+            if bars[act_i].close <= vwap_act or \
+                    e20[act_i] <= e20[max(0, act_i - 3)]:
+                continue        # context gate failed (SOP: stand aside)
+            chosen = (c_i, c_px, leg, L1, act_i)
+            break
+        if chosen is None:
+            self.watch.discard(key)
+            return None
+        c_i, c_px, leg, L1, act_i = chosen
+        L1618 = c_px + 1.618 * leg
+
+        # ---- 3. zones -----------------------------------------------------
+        zones = []                                   # (type, lo, hi, form_i)
+        ext_i = max(range(act_i, n), key=lambda i: bars[i].high)
+        ext_px = bars[ext_i].high
+        b2 = next(((pi, px) for pi, px in ph if pi > act_i), None)
+        if ext_px >= L1618 and ext_px > c_px:
+            leg2 = ext_px - c_px
+            zones.append(("T02", ext_px - 0.618 * leg2, ext_px - 0.5 * leg2,
+                          ext_i))
+        elif b2 is not None and b2[1] > L1:
+            leg2 = b2[1] - c_px
+            if leg2 > 0:
+                zones.append(("T01", b2[1] - 0.618 * leg2, b2[1] - 0.5 * leg2,
+                              b2[0] + self.K))
+        # Type 03: Mother Fib from the day's opening impulse
+        if pl and ph:
+            a0 = pl[0]
+            b0s = [p for p in ph if p[0] > a0[0]]
+            c0s = ([p for p in pl if p[0] > b0s[0][0]] if b0s else [])
+            if b0s and c0s:
+                mleg = b0s[0][1] - a0[1]
+                if mleg > 0 and a0[1] > 0 and \
+                        mleg / a0[1] * 100.0 >= float(cfg["impulse_min_pct"]):
+                    m236 = c0s[0][1] + 0.236 * mleg
+                    pad_m = float(cfg["fib_tol_pct"]) / 100.0 * m236
+                    zones.append(("T03", m236 - pad_m, m236 + pad_m, act_i))
+
+        for ztype, zl, zh, form_i in zones:
+            if zh > zl:
+                sig = self._trigger(symbol, bars, side, ztype, zl, zh,
+                                    form_i, n)
+                if sig:
+                    return sig
+        self.watch.add(key)      # activation alive - keep polling
+        return None
+
+    def _trigger(self, symbol, bars, side, ztype, zl, zh, form_i, n):
+        cfg = self.cfg
+        key = (symbol, side)
+        mid = (zl + zh) / 2.0
+        pad = float(cfg["fib_tol_pct"]) / 100.0 * mid
+        expiry = int(cfg["trigger_expiry_bars"])
+
+        # latest 2R+1G whose green candle closes inside the zone
+        best = None
+        for g in range(max(form_i + 2, 2), n):
+            r1, r2, gr = bars[g - 2], bars[g - 1], bars[g]
+            if not (r1.close < r1.open and r2.close < r2.open
+                    and gr.close > gr.open):
+                continue
+            if not (r1.low <= zh and r2.low <= zh):
+                continue                       # reds must reach the zone
+            if min(r1.low, r2.low) < zl - pad:
+                continue                       # ...and stay inside it
+            if not (zl - pad <= gr.close <= zh + pad):
+                continue                       # green closes in the zone
+            if gr.low < zl - pad:
+                continue
+            if gr.high - gr.low < float(cfg["green_min_range_pct"]) / 100.0 * gr.close:
+                continue                       # noise-dominated green candle
+            best = g
+        if best is None:
+            return None
+        # zone must not have failed before the pattern
+        for i in range(form_i, best):
+            if bars[i].close < zl - pad:
+                self.watch.discard(key)
+                return None
+
+        gr = bars[best]
+        entry = round_tick(gr.high + 0.05, "up")
+        stop = round_tick(gr.low - 0.05, "down")
+        note = f"S1 {ztype} pocket {zl:.2f}-{zh:.2f} 2R+1G"
+        # sizing + SOP 4.1 guards (analysis space; un-inverted on fill)
+        sig = _size_and_check(symbol, "LONG", entry, stop, gr, self.cfg,
+                              f"S1_FIB_{ztype}", note)
+        if sig is None:
+            return None
+
+        # trigger: a later bar trades through the buy stop within expiry
+        end = min(n, best + 1 + expiry)
+        for j in range(best + 1, end):
+            if bars[j].close < zl - pad:       # zone failed while waiting
+                self.watch.discard(key)
+                return None
+            if bars[j].high >= entry:
+                fill = bars[j]
+                sig.date = fill.ts.date().isoformat()
+                sig.sig_time = _hhmm(fill.ts)  # stamped on the fill bar
+                if side == "SHORT":
+                    sig.entry = round(-sig.entry, 2)
+                    sig.stop = round(-sig.stop, 2)
+                    sig.target = round(-sig.target, 2)
+                    sig.direction = "SHORT"
+                sig.reward_amt = abs(sig.target - sig.entry) * sig.qty
+                return sig
+        if n >= best + 1 + expiry:
+            self.watch.discard(key)            # trigger expired -> void
+        else:
+            self.watch.add(key)                # still waiting
+        return None
+
+
+# ===========================================================================
+# STRATEGY 3 - FIVE-TIMEFRAME CHOCH EXECUTION (SOP 3.3)
+# ===========================================================================
+class ChoChEngine:
+    """Strategy 3 - Five-Timeframe CHoCH execution.
+
+    * W1/D1 bias is computed from daily closes (structure proxy: the last
+      confirmed swing high AND swing low are both higher = BULL, both
+      lower = BEAR, anything else = no Strategy 3 that day - SOP Step 2).
+    * H4 POI zones are normally produced by the AutoPoi engine every
+      morning (poi_zones_auto.csv); zones you mark yourself in
+      poi_zones.csv are merged on top and take precedence in spirit -
+      both files are tradable. Only marked zones are tradable - floating
+      price is never traded (SOP golden rule).
+    * Steps 4-7 automated on the live feed: price taps the zone on M15
+      data, the last closed H1 bar must confirm (bullish/bearish
+      engulfing, rejection pin bar, or a CHoCH close beyond the prior
+      three H1 bars), then an M15 candle must close in direction. Entry =
+      that M15 close; stop = one tick beyond the POI extreme; target =
+      nearest opposing POI if that is >= 2R, else fixed 3R.
+    """
+
+    def __init__(self, cfg, base_dir="."):
+        self.cfg = cfg
+        self.poi_path = os.path.join(base_dir,
+                                     cfg.get("poi_file", "poi_zones.csv"))
+        self.auto_path = os.path.join(base_dir,
+                                      cfg.get("poi_auto_file",
+                                              "poi_zones_auto.csv"))
+        self._mtime = None
+        self.zones = {}
+        self.reload_zones()
+
+    # ---------------- POI zone files (Step 3; auto + manual) -------------
+    @staticmethod
+    def _read_zone_file(path):
+        zones = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for row in csv.reader(f):
+                    if not row or row[0].strip().startswith("#"):
+                        continue
+                    if row[0].strip().lower() == "symbol":
+                        continue
+                    try:
+                        sym = row[0].strip().upper().replace(".NS", "")
+                        side = row[1].strip().upper()
+                        lo, hi = float(row[2]), float(row[3])
+                        date = row[4].strip() if len(row) > 4 else ""
+                        if side not in ("LONG", "SHORT") or hi <= lo:
+                            continue
+                        zones.setdefault(sym, []).append(
+                            {"side": side, "low": lo, "high": hi,
+                             "date": date})
+                    except Exception:
+                        continue
+        return zones
+
+    def reload_zones(self):
+        """Load zones from the manual file AND the AutoPoi-generated file
+        (either may be absent). Re-reads whenever any mtime changes."""
+        mts = []
+        for p in (self.poi_path, self.auto_path):
+            try:
+                mts.append(os.path.getmtime(p))
+            except OSError:
+                mts.append(None)
+        mts = tuple(mts)
+        if mts == self._mtime:
+            return
+        self._mtime = mts
+        zones = {}
+        for path in (self.poi_path, self.auto_path):
+            for sym, zs in self._read_zone_file(path).items():
+                zones.setdefault(sym, []).extend(zs)
+        self.zones = zones
+        n = sum(len(v) for v in zones.values())
+        if n:
+            print(f"[S3] {n} POI zone(s) on {len(zones)} symbol(s) loaded")
+
+    # ---------------- W1 / D1 bias (Steps 1-2) ---------------------------
+    @staticmethod
+    def _structure(closes, k=2):
+        if len(closes) < 2 * (k + 1):
+            return None
+        ph, pl = pivot_points_on_values(closes, k)
+        if len(ph) < 2 or len(pl) < 2:
+            return None
+        if ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]:
+            return "BULL"
+        if ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]:
+            return "BEAR"
+        return None
+
+    def bias_of(self, symbol, daily_bars):
+        if not daily_bars or len(daily_bars) < 60:
+            return None
+        weekly = {}
+        for b in daily_bars:
+            iso = b.ts.isocalendar()
+            weekly[(iso[0], iso[1])] = b.close   # last close of the week
+        wc = [weekly[key] for key in sorted(weekly)]
+        w = self._structure(wc)
+        d = self._structure([b.close for b in daily_bars[-120:]])
+        if w == "BULL" and d == "BULL":
+            return "BULL"
+        if w == "BEAR" and d == "BEAR":
+            return "BEAR"
+        return None                              # disagreement -> no S3
+
+    # ---------------- execution (Steps 4-7) ------------------------------
+    def update(self, symbol, zones_all, bias, m15, h1, now):
+        """Evaluate every marked zone of this symbol for today."""
+        day = now.date().isoformat()
+        out = []
+        for side, want in (("LONG", "BULL"), ("SHORT", "BEAR")):
+            if bias != want:
+                continue
+            for z in zones_all:
+                if z["side"] != side:
+                    continue
+                if z.get("date") and z["date"] != day:
+                    continue
+                sig = self._eval_zone(symbol, z, zones_all, m15, h1, now,
+                                      side)
+                if sig:
+                    out.append(sig)
+        return out[0] if out else None
+
+    def _eval_zone(self, symbol, z, zones_all, m15, h1, now, side):
+        day = now.date().isoformat()
+        zl, zh = z["low"], z["high"]            # REAL price edges
+        if side == "SHORT":
+            m15 = [Bar(b.ts, -b.open, -b.high, -b.low, -b.close, b.volume)
+                   for b in m15]
+            h1 = [Bar(b.ts, -b.open, -b.high, -b.low, -b.close, b.volume)
+                  for b in h1]
+            fz = {"low": -zh, "high": -zl}       # zone in analysis space
+        else:
+            fz = {"low": zl, "high": zh}
+        tod = [b for b in m15 if b.ts.date().isoformat() == day]
+        if len(tod) < 2:
+            return None
+
+        # Step 4: latest tap of the POI today (never trade floating price)
+        tap = None
+        for b in tod:
+            if b.low <= fz["high"] and b.high >= fz["low"]:
+                tap = b
+        if tap is None:
+            return None
+
+        # Step 5: H1 confirmation at/after the tap (the prior H1 bar is
+        # included so engulfing comparisons have a reference candle)
+        h1b = [b for b in h1 if b.ts.date().isoformat() == day
+               and b.ts + timedelta(minutes=60) >
+               tap.ts - timedelta(minutes=60)]
+        hb, kind = self._h1_confirm(h1b)
+        if hb is None:
+            return None
+
+        # Step 6: M15 confirmation candle close in direction
+        mc = None
+        for i, b in enumerate(tod):
+            if b.ts < hb.ts:
+                continue
+            prev_c = tod[i - 1].close if i > 0 else b.open
+            if b.close > b.open and b.close > prev_c and b.close > fz["low"]:
+                mc = b
+                break
+        if mc is None:
+            return None
+
+        # Step 7: sizing in REAL space - stop one tick beyond the POI
+        # extreme, target = nearest opposing POI if >= 2R, else fixed 3R
+        if side == "LONG":
+            entry = round(mc.close, 2)
+            stop = round_tick(zl - 0.05, "down")
+        else:
+            entry = round(-mc.close, 2)
+            stop = round_tick(zh + 0.05, "up")
+        risk = (entry - stop) if side == "LONG" else (stop - entry)
+        if risk <= 0 or risk / entry > float(self.cfg["max_stop_pct"]) / 100.0:
+            return None
+        risk_amt = float(self.cfg["capital"]) * \
+            float(self.cfg["risk_pct"]) / 100.0
+        qty = int(risk_amt // risk)
+        if qty < 1:
+            return None
+        target = None
+        if side == "LONG":
+            opps = [o for o in zones_all
+                    if o["side"] == "SHORT" and o["low"] > entry]
+            if opps:
+                nearest = min(opps, key=lambda o: o["low"])
+                if nearest["low"] - entry >= 2 * risk:
+                    target = round_tick(nearest["low"], "down")
+        else:
+            opps = [o for o in zones_all
+                    if o["side"] == "LONG" and o["high"] < entry]
+            if opps:
+                nearest = max(opps, key=lambda o: o["high"])
+                if entry - nearest["high"] >= 2 * risk:
+                    target = round_tick(nearest["high"], "up")
+        if target is None:
+            target = (round_tick(entry + 3.0 * risk, "nearest")
+                      if side == "LONG"
+                      else round_tick(entry - 3.0 * risk, "nearest"))
+        reward_amt = abs(target - entry) * qty
+        # SOP 4.1 capital-price rejection + cost hurdle
+        if entry * qty > float(self.cfg["capital"]) or \
+                reward_amt < float(self.cfg.get("cost_rt", 50.0)) + 50.0:
+            return None
+        ztxt = f"{zl:.2f}-{zh:.2f}"
+        return Signal(symbol, side, day, _hhmm(mc.ts), entry, stop, target,
+                      qty, round(risk, 2), round(risk_amt, 2),
+                      round(reward_amt, 2),
+                      f"S3 {kind} @ POI {ztxt}", "S3_CHOCH")
+
+    @staticmethod
+    def _h1_confirm(h1b):
+        """(bar, kind) for the last closed H1 bar: engulfing / pin / CHoCH."""
+        if len(h1b) < 2:
+            return None, None
+        hb, prev = h1b[-1], h1b[-2]
+        body = abs(hb.close - hb.open)
+        rng = hb.high - hb.low
+        # bullish engulfing
+        if (hb.close > hb.open and prev.close < prev.open
+                and hb.close >= prev.open and hb.open <= prev.close):
+            return hb, "engulfing"
+        # rejection pin bar: long lower wick, close in the top third
+        if rng > 0 and body > 0:
+            lower = min(hb.open, hb.close) - hb.low
+            if lower >= 2.0 * body and (hb.close - hb.low) / rng >= 0.66:
+                return hb, "pin bar"
+        # CHoCH proxy: close beyond the highs of the prior three H1 bars
+        if len(h1b) >= 4 and hb.close > max(b.high for b in h1b[-4:-1]):
+            return hb, "choch"
+        return None, None
+
+
+# ===========================================================================
+# AUTO-POI - STRATEGY 3 ZONE MARKER (automates SOP Step 3)
+# ===========================================================================
+class AutoPoi:
+    """Marks the H4 supply/demand zones for Strategy 3 automatically.
+
+    Every morning (first scan cycle of the day) it rebuilds the zone map
+    from Yahoo 1-hour history, so the trader never has to enter zones by
+    hand. The discipline of the SOP is preserved: zones are derived only
+    from data up to the PREVIOUS close, written once, and stay fixed for
+    the whole session - floating price is never traded.
+
+    How a zone is found (classic H4 supply / demand):
+      1. Closed 1h bars are grouped into two H4 candles per NSE session:
+         H4-A = 09:15-13:15 IST, H4-B = 13:15-15:30 IST.
+      2. Fractal swing highs (k=2 confirmed) become SUPPLY zones
+         (side SHORT): body-top .. high of the pivot candle.
+         Fractal swing lows become DEMAND zones (side LONG):
+         low .. body-bottom of the pivot candle.
+      3. Fresh-only: if any later H4 candle CLOSED through the far edge
+         of a zone, the zone is broken and discarded.
+      4. Sanity filters: zone height <= s3_poi_max_zone_pct, distance
+         from the last close <= s3_poi_proximity_pct, and only the
+         nearest s3_poi_max_per_side zones per side are kept.
+      5. Zones are written to poi_zones_auto.csv stamped with today's
+         date, so they expire automatically at midnight and a fresh map
+         is generated next session (idempotent: if the file already
+         carries today's marker, nothing is re-fetched).
+      6. Optional W1/D1 bias pre-filter: if a bias function is provided,
+         only symbols whose bias agrees with the zone side are written
+         (BULL -> demand zones, BEAR -> supply zones), which is exactly
+         what the SOP Step 2 gate would do intraday anyway.
+
+    Manual zones in poi_zones.csv still work alongside - both files are
+    merged by ChoChEngine.reload_zones().
+    """
+
+    def __init__(self, cfg, provider, base_dir="."):
+        self.cfg = cfg
+        self.provider = provider
+        self.out_path = os.path.join(base_dir,
+                                     cfg.get("poi_auto_file",
+                                             "poi_zones_auto.csv"))
+
+    # ---------------- daily idempotence gate -----------------------------
+    def _generated_date(self):
+        """Date string the auto file was generated for, or None."""
+        try:
+            with open(self.out_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("# generated:"):
+                        return s.split(":", 1)[1].strip().split()[0]
+        except OSError:
+            pass
+        return None
+
+    def ensure_today(self, universe, now, bias_of=None):
+        """Generate today's zone map if not done yet. Returns
+        (zone_count, symbol_count) when freshly written, or None when
+        the map already exists (skip - nothing is re-fetched)."""
+        today = now.date().isoformat()
+        if self._generated_date() == today:
+            return None
+        zones = self.detect(universe, now, bias_of=bias_of)
+        n, n_sym = self.write(zones, today)
+        print(f"[S3] auto-POI: {n} fresh zone(s) on {n_sym} symbol(s) "
+              f"written to {os.path.basename(self.out_path)} for {today}")
+        return n, n_sym
+
+    # ---------------- H4 construction -------------------------------------
+    @staticmethod
+    def _h4_buckets(bars_1h):
+        """Group closed 1h bars into two H4 candles per NSE session."""
+        groups, order = {}, []
+        for b in bars_1h:
+            hm = b.ts.hour * 60 + b.ts.minute
+            if hm < 9 * 60 + 15:                 # stray pre-open print
+                continue
+            key = (b.ts.date(), 0 if hm < 13 * 60 + 15 else 1)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(b)
+        out = []
+        for key in order:
+            g = groups[key]
+            out.append(Bar(g[0].ts, g[0].open, max(x.high for x in g),
+                           min(x.low for x in g), g[-1].close,
+                           sum(x.volume for x in g)))
+        return out
+
+    # ---------------- zone detection for one symbol -----------------------
+    def _zones_from_h4(self, h4):
+        lookback = int(self.cfg.get("s3_poi_lookback_days", 30))
+        maxz = float(self.cfg.get("s3_poi_max_zone_pct", 2.0)) / 100.0
+        prox = float(self.cfg.get("s3_poi_proximity_pct", 6.0)) / 100.0
+        cap = int(self.cfg.get("s3_poi_max_per_side", 2))
+        h4 = h4[-(lookback * 2):]
+        if len(h4) < 12:
+            return []
+        last = h4[-1].close
+        if last <= 0:
+            return []
+        piv_hi, _ = pivot_points_on_values([b.high for b in h4], 2)
+        _, piv_lo = pivot_points_on_values([b.low for b in h4], 2)
+        cands = []
+        for idx, _v in piv_hi:                   # supply (SHORT side)
+            p = h4[idx]
+            hi, lo = p.high, max(p.open, p.close)
+            if hi - lo < 0.01 * last / 100:      # degenerate flat top
+                continue
+            if any(b.close > hi for b in h4[idx + 1:]):
+                continue                         # closed through -> broken
+            cands.append({"side": "SHORT", "low": round(lo, 2),
+                          "high": round(hi, 2), "d": abs(
+                              (lo + hi) / 2 - last)})
+        for idx, _v in piv_lo:                   # demand (LONG side)
+            p = h4[idx]
+            lo, hi = p.low, min(p.open, p.close)
+            if hi - lo < 0.01 * last / 100:
+                continue
+            if any(b.close < lo for b in h4[idx + 1:]):
+                continue
+            cands.append({"side": "LONG", "low": round(lo, 2),
+                          "high": round(hi, 2), "d": abs(
+                              (lo + hi) / 2 - last)})
+        keep = [z for z in cands
+                if (z["high"] - z["low"]) / ((z["low"] + z["high"]) / 2)
+                <= maxz and z["d"] / last <= prox]
+        final = []
+        for side in ("LONG", "SHORT"):
+            sz = sorted((z for z in keep if z["side"] == side),
+                        key=lambda z: z["d"])
+            final.extend(sz[:cap])
+        for z in final:
+            z.pop("d", None)
+        return final
+
+    # ---------------- full-universe detection ------------------------------
+    def detect(self, universe, now, bias_of=None):
+        """{sym: [zones]} for the whole universe from 1h history."""
+        period = str(self.cfg.get("s3_poi_hist_period", "60d"))
+        h1 = self.provider.get_intraday(sorted(universe), "60m", period,
+                                        now=now)
+        if not h1:
+            raise ProviderUnavailable("no 1h history returned for POI "
+                                      "detection")
+        today = now.date().isoformat()
+        bias = {}
+        if bias_of is not None:
+            try:
+                # same period as _scan_s3's bias pass so both gates agree
+                daily = self.provider.get_daily(sorted(universe), "1y",
+                                                now=now)
+                bias = {s: bias_of(s, daily.get(s)) for s in h1}
+            except Exception as e:
+                print(f"[S3] auto-POI bias pre-filter skipped ({e})")
+                bias = {}
+        zones = {}
+        for s, bars in h1.items():
+            if not bars:
+                continue
+            h4 = [b for b in self._h4_buckets(bars)
+                  if b.ts.date().isoformat() < today]
+            zs = self._zones_from_h4(h4)
+            if not zs:
+                continue
+            b = bias.get(s)
+            if bias:                 # pre-filter ran -> enforce it
+                if b == "BULL":      # SOP Step 2: trade demand only
+                    zs = [z for z in zs if z["side"] == "LONG"]
+                elif b == "BEAR":    # trade supply only
+                    zs = [z for z in zs if z["side"] == "SHORT"]
+                else:                # None: W1/D1 disagree -> no S3 today
+                    continue
+            # pre-filter skipped (daily data down) -> keep both sides;
+            # the intraday bias gate in _scan_s3 decides later
+            if zs:
+                zones[s] = zs
+        return zones
+
+    # ---------------- CSV output -------------------------------------------
+    def write(self, zones, today):
+        """Write the map with a generated-marker line; returns
+        (zone_count, symbol_count)."""
+        with open(self.out_path, "w", newline="", encoding="utf-8") as f:
+            f.write("# AUTO-GENERATED by scanner v%s - DO NOT EDIT\n"
+                    % VERSION)
+            f.write("# generated: %s (rebuilt every morning before the "
+                    "first scan)\n" % today)
+            f.write("# H4 supply/demand zones for Strategy 3; they expire "
+                    "at midnight.\n")
+            f.write("# Manual additions go in poi_zones.csv (merged on "
+                    "top).\n")
+            f.write("symbol,side,zone_low,zone_high,date\n")
+            n = 0
+            for sym in sorted(zones):
+                for z in zones[sym]:
+                    f.write("%s,%s,%.2f,%.2f,%s\n"
+                            % (sym, z["side"], z["low"], z["high"], today))
+                    n += 1
+        return n, len(zones)
+
+
+# ===========================================================================
+# DATA PROVIDERS
+# ===========================================================================
+class ProviderUnavailable(Exception):
+    pass
+
+
+class NseBlockedError(Exception):
+    pass
+
+
+def yf_sym(sym):
+    return sym if "." in sym else sym + ".NS"
+
+
+class NseFast:
+    """Fast lane: one HTTP request to NSE returns quotes for the whole
+    NIFTY 100 (LTP / day high / day low / volume). Used for tick-level
+    candidate detection between bar confirmations. Many cloud/server IPs are
+    blocked by NSE (HTTP 403) - home broadband usually works."""
+    BASE = "https://www.nseindia.com"
+    HDRS = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": BASE + "/market-data/live-equity-market",
+    }
+
+    def __init__(self, cfg=None, timeout=10):
+        self.timeout = timeout
+        self._cookies = None
+
+    def _http(self, url):
+        import http.cookiejar
+        if self._cookies is None:
+            self._cookies = http.cookiejar.CookieJar()
+            self._opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self._cookies))
+        req = urllib.request.Request(url, headers=self.HDRS)
+        with self._opener.open(req, timeout=self.timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def warmup(self):
+        self._http(self.BASE + "/market-data/live-equity-market")
+
+    def get_snapshot(self):
+        """{NSE_SYMBOL: {ltp, high, low, vol, prev_close}} for NIFTY 100."""
+        try:
+            data = self._http(
+                self.BASE + "/api/equity-stockIndices?index=" +
+                urllib.parse.quote("NIFTY 100"))
+        except urllib.error.HTTPError as e:
+            raise NseBlockedError(f"NSE returned HTTP {e.code}")
+        out = {}
+        for row in data.get("data", []):
+            sym = row.get("symbol")
+            if not sym or sym.startswith("NIFTY"):
+                continue
+            out[sym] = {
+                "ltp": row.get("lastPrice") or 0,
+                "high": row.get("dayHigh") or 0,
+                "low": row.get("dayLow") or 0,
+                "vol": row.get("totalTradedVolume") or 0,
+                "prev_close": row.get("previousClose") or 0,
+            }
+        return out
+
+    def get_quotes(self, symbols):
+        try:
+            snap = self.get_snapshot()
+        except NseBlockedError:
+            raise
+        except Exception as e:
+            print(f"[NSE] snapshot failed: {e}")
+            return {}
+        return {s: snap[s] for s in symbols if s in snap}
+
+
+class YahooProvider:
+    """Slow lane / fallback: 5-minute OHLCV bars from Yahoo Finance.
+    Works from most networks; data can lag a few minutes - which is exactly
+    why the SOP forces a broker-terminal verification before any entry."""
+    name = "yahoo"
+
+    def __init__(self, cfg=None):
+        try:
+            import yfinance as yf  # noqa
+        except Exception as e:
+            raise ProviderUnavailable(
+                f"yfinance not available ({e}). Run: pip install yfinance")
+        self.yf = yf
+
+    @staticmethod
+    def _parse(sub, sym):
+        import pandas as pd  # noqa - only for isinstance checks / dropna
+        sub = sub.dropna(subset=["Close"])
+        bars = []
+        for idx, row in sub.iterrows():
+            ts = idx.to_pydatetime()
+            ts = ts.replace(tzinfo=IST) if ts.tzinfo is None else ts.astimezone(IST)
+            try:
+                v = int(float(row.get("Volume") or 0))
+            except Exception:
+                v = 0
+            bars.append(Bar(ts, float(row["Open"]), float(row["High"]),
+                            float(row["Low"]), float(row["Close"]), v))
+        return bars
+
+    @staticmethod
+    def _closed_cutoff(now, minutes):
+        """Newest CLOSED bar-start timestamp for a `minutes` interval."""
+        cutoff = now.replace(second=0, microsecond=0)
+        cutoff -= timedelta(minutes=cutoff.minute % minutes)
+        return cutoff - timedelta(minutes=minutes)
+
+    def _download(self, symbols, period, interval):
+        return self.yf.download([yf_sym(s) for s in symbols], period=period,
+                                interval=interval, group_by="ticker",
+                                auto_adjust=False, progress=False,
+                                threads=True)
+
+    @staticmethod
+    def _split(df, symbols):
+        multi = hasattr(df.columns, "levels") and \
+            getattr(df.columns, "nlevels", 1) > 1
+        for s in symbols:
+            try:
+                sub = df[yf_sym(s)] if multi else df
+                if sub is None or len(sub) == 0:
+                    continue
+                yield s, sub
+            except Exception:
+                continue
+
+    def get_bars(self, symbols, now=None):
+        """Today's 5m bars for a set of NSE symbols. Incomplete (forming)
+        bars are dropped so signals are only confirmed on closed bars."""
+        out = {}
+        if not symbols:
+            return out
+        try:
+            df = self._download(symbols, "1d", "5m")
+        except Exception as e:
+            print(f"[YF] batch download failed: {e}")
+            return out
+        if df is None or len(df) == 0:
+            return out
+        now = now or now_ist()
+        cutoff = self._closed_cutoff(now, 5)
+        for s, sub in self._split(df, symbols):
+            try:
+                bars = [b for b in self._parse(sub, s) if b.ts <= cutoff]
+                if bars:
+                    out[s] = bars
+            except Exception:
+                continue
+        return out
+
+    def get_intraday(self, symbols, interval="15m", period="5d", now=None):
+        """{sym: [Bar]} closed bars for a custom intraday interval
+        (15m / 60m). Used by Strategy 3 (H1 + M15 confirmation)."""
+        out = {}
+        if not symbols:
+            return out
+        mins = int(interval.rstrip("m")) if interval.endswith("m") else 60
+        try:
+            df = self._download(symbols, period, interval)
+        except Exception as e:
+            print(f"[YF] {interval} download failed: {e}")
+            return out
+        if df is None or len(df) == 0:
+            return out
+        now = now or now_ist()
+        cutoff = self._closed_cutoff(now, mins)
+        for s, sub in self._split(df, symbols):
+            try:
+                bars = [b for b in self._parse(sub, s) if b.ts <= cutoff]
+                if bars:
+                    out[s] = bars
+            except Exception:
+                continue
+        return out
+
+    def get_daily(self, symbols, period="1y", now=None):
+        """{sym: [Bar]} daily bars - used for the Strategy 3 W1/D1 bias."""
+        out = {}
+        if not symbols:
+            return out
+        try:
+            df = self._download(symbols, period, "1d")
+        except Exception as e:
+            print(f"[YF] daily download failed: {e}")
+            return out
+        if df is None or len(df) == 0:
+            return out
+        for s, sub in self._split(df, symbols):
+            try:
+                bars = self._parse(sub, s)
+                if bars:
+                    out[s] = bars
+            except Exception:
+                continue
+        return out
+
+    def get_bars_history(self, symbol, date_str, now=None):
+        """Historical 5m bars for one trading day (used by the journal to
+        back-fill outcomes). Yahoo keeps ~60 days of 5m data."""
+        start = datetime.strptime(date_str, "%Y-%m-%d")
+        end = start + timedelta(days=1)
+        df = self.yf.Ticker(yf_sym(symbol)).history(
+            start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
+            interval="5m", auto_adjust=False)
+        if df is None or len(df) == 0:
+            return []
+        return self._parse(df, symbol)
+
+
+def make_bar_provider(cfg):
+    mode = str(cfg.get("data_mode", "auto")).lower()
+    if mode == "nse":
+        # even in NSE mode, bar confirmation comes from Yahoo
+        return YahooProvider(cfg)
+    return YahooProvider(cfg)
+
+
+def fast_candidates(quotes):
+    """Tick-level candidate detection from NSE quotes: a stock sitting at (or
+    within 5 bps of) its day high is a LONG candidate; at its day low, SHORT.
+    These are NOT signals - bar confirmation must still pass all gates."""
+    cands = set()
+    for sym, q in (quotes or {}).items():
+        try:
+            ltp, high, low = float(q["ltp"]), float(q["high"]), float(q["low"])
+        except Exception:
+            continue
+        if ltp <= 0 or high <= low or high <= 0:
+            continue
+        if ltp >= high - 0.0005 * high:
+            cands.add(sym)
+        elif ltp <= low + 0.0005 * low:
+            cands.add(sym)
+    return cands
+
+# ===========================================================================
+# TRADE JOURNAL - self-generating, self-updating logbook with day verdicts
+# ===========================================================================
+TRADE_COLS = ["TradeID", "Date", "SignalTime", "Symbol", "Direction", "Setup",
+              "Entry", "StopLoss", "Target", "Qty", "RiskPerShare", "RiskAmt",
+              "RewardAmt", "RR", "Status", "ExitPrice", "ExitTime", "ExitReason",
+              "Result", "PnL_R", "PnL_Amt", "UpdatedAt", "Notes"]
+
+SUMMARY_COLS = ["Date", "Trades", "Wins", "Losses", "Flats", "Open",
+                "WinRatePct", "NetR", "NetPnlAmt", "BreakerTripped",
+                "DayVerdict", "Notes"]
+
+
+class TradeJournal:
+    """One class that does everything the journal needs:
+
+      * AUTO-GENERATE  - creates trade_journal.csv / daily_summary.csv /
+        journal_state.json on first use (also self-heals a deleted file).
+      * RECORD         - every confirmed signal becomes an OPEN trade row.
+      * TRACK          - every cycle each OPEN trade is checked against its
+        stop and target using closed 5m bars (and, in NSE mode, live quotes);
+        outcome is written back: WIN / LOSS / EOD square-off.
+      * VERDICT        - daily_summary.csv is rebuilt after every closed
+        trade. The DayVerdict answers "did the trades fail today?":
+            SUCCESS - day closed with net positive R
+            FAILED  - day closed with net negative R, OR a circuit breaker
+                      tripped (loss streak / day loss limit)
+            FLAT    - net zero
+        A trailing '*' marks a verdict that is still live (trades open).
+      * SURVIVE        - open trades persist in journal_state.json; on the
+        next start (or via journal.py) missed sessions are back-filled from
+        price history and the verdicts are refreshed.
+    """
+
+    def __init__(self, base_dir=".", cfg=None, notify=None):
+        self.cfg = cfg or dict(DEFAULT_CONFIG)
+        self.notify = notify if notify is not None else (lambda m: None)
+        j = self.cfg.get("journal") or {}
+        self.dir = os.path.join(base_dir, j.get("folder", "journal"))
+        self.trades_csv = os.path.join(self.dir, "trade_journal.csv")
+        self.summary_csv = os.path.join(self.dir, "daily_summary.csv")
+        self.state_json = os.path.join(self.dir, "journal_state.json")
+        self.state = {"open": [], "day_verdict_sent": {}, "breaker_notified": {}}
+        self.ensure_files()
+
+    # ---------------- file management (auto-generation) -------------------
+    def ensure_files(self):
+        os.makedirs(self.dir, exist_ok=True)
+        if not os.path.exists(self.trades_csv):
+            self._write_csv(self.trades_csv, TRADE_COLS, [])
+            print(f"[JOURNAL] created {self.trades_csv}")
+        if not os.path.exists(self.summary_csv):
+            self._write_csv(self.summary_csv, SUMMARY_COLS, [])
+            print(f"[JOURNAL] created {self.summary_csv}")
+        if os.path.exists(self.state_json):
+            try:
+                with open(self.state_json, "r", encoding="utf-8") as f:
+                    self.state = json.load(f)
+                self.state.setdefault("open", [])
+                self.state.setdefault("day_verdict_sent", {})
+                self.state.setdefault("breaker_notified", {})
+            except Exception as e:
+                print(f"[JOURNAL] state file unreadable ({e}); rebuilding")
+                self.state = {"open": [], "day_verdict_sent": {},
+                              "breaker_notified": {}}
+                self._rebuild_state_from_csv()
+        else:
+            self._rebuild_state_from_csv()
+        self.state.setdefault("squareoff_alert_sent", {})
+        self._save_state()
+
+    def _rebuild_state_from_csv(self):
+        """CSV is the source of truth: restore open-trade state from it."""
+        opens = [r for r in self._read_trades() if r.get("Status") == "OPEN"]
+        self.state["open"] = [self._row_to_open(r) for r in opens]
+        if opens:
+            print(f"[JOURNAL] restored {len(opens)} open trade(s) from CSV")
+
+    @staticmethod
+    def _row_to_open(r):
+        return {"trade_id": r["TradeID"], "date": r["Date"],
+                "signal_time": r["SignalTime"], "symbol": r["Symbol"],
+                "direction": r["Direction"], "entry": r["Entry"],
+                "stop": r["StopLoss"], "target": r["Target"], "qty": r["Qty"],
+                "risk_ps": r["RiskPerShare"]}
+
+    @staticmethod
+    def _write_csv(path, cols, rows):
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        os.replace(tmp, path)          # atomic write
+
+    @staticmethod
+    def _read_csv(path):
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            return [dict(r) for r in csv.DictReader(f)]
+
+    def _read_trades(self):
+        return self._read_csv(self.trades_csv)
+
+    def _save_state(self):
+        tmp = self.state_json + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=1)
+        os.replace(tmp, self.state_json)
+
+    # ---------------- recording -------------------------------------------
+    def has_trade(self, trade_id):
+        if any(o["trade_id"] == trade_id for o in self.state["open"]):
+            return True
+        return any(r.get("TradeID") == trade_id for r in self._read_trades())
+
+    def record_signal(self, sig):
+        """Append a confirmed signal as an OPEN trade. Dedup by TradeID."""
+        if self.has_trade(sig.trade_id):
+            return None
+        row = {
+            "TradeID": sig.trade_id, "Date": sig.date,
+            "SignalTime": sig.sig_time, "Symbol": sig.symbol,
+            "Direction": sig.direction, "Setup": sig.setup,
+            "Entry": fmt2(sig.entry), "StopLoss": fmt2(sig.stop),
+            "Target": fmt2(sig.target), "Qty": sig.qty,
+            "RiskPerShare": fmt2(sig.risk_ps), "RiskAmt": fmt2(sig.risk_amt),
+            "RewardAmt": fmt2(sig.reward_amt),
+            "RR": f"1:{self.cfg.get('rr', 3.0):g}",
+            "Status": "OPEN", "ExitPrice": "", "ExitTime": "",
+            "ExitReason": "", "Result": "", "PnL_R": "", "PnL_Amt": "",
+            "UpdatedAt": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            "Notes": sig.note,
+        }
+        rows = self._read_trades()
+        rows.append(row)
+        self._write_csv(self.trades_csv, TRADE_COLS, rows)
+        self.state["open"].append(self._row_to_open(row))
+        self._save_state()
+        print(f"[JOURNAL] OPEN  {sig.trade_id} entry {sig.entry} "
+              f"SL {sig.stop} TGT {sig.target} qty {sig.qty}")
+        return sig.trade_id
+
+    # ---------------- outcome tracking -------------------------------------
+    def on_quote(self, symbol, quote, now=None):
+        """NSE fast-lane check between bar cycles: the last traded price is
+        an actual print, so LTP beyond a level means the level traded."""
+        now = now or now_ist()
+        for t in list(self.state["open"]):
+            if t["symbol"] != symbol or t["date"] != now.date().isoformat():
+                continue
+            try:
+                ltp = float(quote.get("ltp") or 0)
+                high, low = float(quote.get("high") or 0), float(quote.get("low") or 0)
+            except Exception:
+                continue
+            if ltp <= 0:
+                continue
+            stop, target = float(t["stop"]), float(t["target"])
+            if t["direction"] == "LONG":
+                both = high >= target and low <= stop
+                hit_stop, hit_tgt = ltp <= stop, ltp >= target
+            else:
+                both = low <= target and high >= stop
+                hit_stop, hit_tgt = ltp >= stop, ltp <= target
+            if both:   # cannot tell which came first -> conservative LOSS
+                return self.finalize(t, stop, "STOP_HIT", now, "both levels seen; conservative")
+            if hit_stop:
+                return self.finalize(t, stop, "STOP_HIT", now)
+            if hit_tgt:
+                return self.finalize(t, target, "TARGET_HIT", now)
+
+    def on_bars(self, symbol, bars, now=None):
+        """Bar-precise outcome check for every OPEN trade of this symbol,
+        using only bars AFTER the entry bar (the 0.10% stop buffer guarantees
+        the signal bar itself cannot trigger anything)."""
+        now = now or now_ist()
+        sq = cfg_squareoff(self.cfg)
+        out = None
+        for t in list(self.state["open"]):
+            if t["symbol"] != symbol:
+                continue
+            seq = [b for b in bars
+                   if b.ts.date().isoformat() == t["date"]
+                   and b.ts.time() > parse_hhmm(t["signal_time"])]
+            if not seq:
+                continue
+            stop, target = float(t["stop"]), float(t["target"])
+            long = t["direction"] == "LONG"
+            res = None
+            for b in seq:
+                hit_stop = (b.low <= stop) if long else (b.high >= stop)
+                hit_tgt = (b.high >= target) if long else (b.low <= target)
+                if hit_stop and hit_tgt:      # ambiguous bar -> LOSS first
+                    res = self.finalize(t, stop, "STOP_HIT", b.ts,
+                                        "bar touched both levels; conservative")
+                    break
+                if hit_stop:
+                    res = self.finalize(t, stop, "STOP_HIT", b.ts)
+                    break
+                if hit_tgt:
+                    res = self.finalize(t, target, "TARGET_HIT", b.ts)
+                    break
+            if not res:
+                # still open: square off at/after the SOP square-off time
+                session_over = (t["date"] < now.date().isoformat() or
+                                now.time() >= sq)
+                if session_over:
+                    res = self.finalize(
+                        t, seq[-1].close, "EOD_SQUAREOFF", seq[-1].ts,
+                        None if t["date"] == now.date().isoformat()
+                        else "auto-finalized after session end")
+            out = out or res
+        return out
+
+    def finalize(self, t, exit_price, reason, ts, note=None):
+        """Write the outcome of one trade, then refresh the day verdict."""
+        rows = self._read_trades()
+        row = None
+        for r in rows:
+            if r.get("TradeID") == t["trade_id"] and r.get("Status") == "OPEN":
+                row = r
+                break
+        if row is None:
+            return None
+        entry = float(row["Entry"])
+        risk_ps = float(row["RiskPerShare"]) or 1.0
+        qty = int(float(row["Qty"] or 0))
+        pnl_ps = (exit_price - entry) if row["Direction"] == "LONG" else (entry - exit_price)
+        pnl_r = pnl_ps / risk_ps if risk_ps else 0.0
+        pnl_amt = pnl_ps * qty
+        result = "WIN" if pnl_r > 0.05 else ("LOSS" if pnl_r < -0.05 else "FLAT")
+        row["Status"] = "CLOSED"
+        row["ExitPrice"] = fmt2(exit_price)
+        row["ExitTime"] = _hhmm(ts)
+        row["ExitReason"] = reason
+        row["Result"] = result
+        row["PnL_R"] = f"{pnl_r:.3f}"
+        row["PnL_Amt"] = fmt2(pnl_amt)
+        row["UpdatedAt"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+        if note:
+            row["Notes"] = (row.get("Notes", "") + " | " + note).strip(" |")
+        self._write_csv(self.trades_csv, TRADE_COLS, rows)
+        self.state["open"] = [o for o in self.state["open"]
+                              if o["trade_id"] != t["trade_id"]]
+        self._save_state()
+        emoji = "✅" if result == "WIN" else ("❌" if result == "LOSS" else "➖")
+        self.notify(f"{emoji} {row['Symbol']} {row['Direction']} -> {reason} "
+                    f"-> {result} {pnl_r:+.2f}R (Rs {pnl_amt:+.2f}) @ {fmt2(exit_price)}")
+        print(f"[JOURNAL] CLOSE {t['trade_id']} {reason} -> {result} "
+              f"{pnl_r:+.2f}R (Rs {pnl_amt:+.2f})")
+        self.recompute_day(row["Date"])
+        return result
+
+    # ---------------- day verdict / summary --------------------------------
+    def recompute_day(self, date_str, now=None):
+        """Rebuild one day's row in daily_summary.csv and return it."""
+        now = now or now_ist()
+        rows = [r for r in self._read_trades() if r.get("Date") == date_str]
+        if not rows:
+            return None
+        closed = [r for r in rows if r.get("Status") != "OPEN"]
+        open_n = len(rows) - len(closed)
+        wins = sum(1 for r in closed if r.get("Result") == "WIN")
+        losses = sum(1 for r in closed if r.get("Result") == "LOSS")
+        flats = len(closed) - wins - losses
+        net_r = sum(float(r["PnL_R"] or 0) for r in closed)
+        net_amt = sum(float(r["PnL_Amt"] or 0) for r in closed)
+        wr = (100.0 * wins / len(closed)) if closed else 0.0
+
+        # circuit breakers (SOP): loss streak and/or day loss limit
+        j = self.cfg.get("journal") or {}
+        max_streak = int(j.get("max_consecutive_losses", 2) or 0)
+        limit_r = float(j.get("daily_loss_limit_R", -2.0) or 0)
+        limit_amt = float(j.get("daily_loss_limit_amt", 0) or 0)
+        streak = worst = 0
+        for r in sorted(closed, key=lambda r: r.get("ExitTime", "")):
+            if r.get("Result") == "LOSS":
+                streak += 1
+                worst = max(worst, streak)
+            else:
+                streak = 0
+        tripped = ((max_streak > 0 and worst >= max_streak) or
+                   (limit_r < 0 and net_r <= limit_r) or
+                   (limit_amt > 0 and net_amt <= -abs(limit_amt)))
+
+        if not closed and open_n:
+            verdict, live = "PENDING", True
+        else:
+            if tripped:
+                verdict = "FAILED"
+            elif net_r > 0.05:
+                verdict = "SUCCESS"
+            elif net_r < -0.05:
+                verdict = "FAILED"
+            else:
+                verdict = "FLAT"
+            # a verdict is provisional while trades are open OR while the
+            # session is still running (more trades can still happen)
+            session_running = (date_str == now.date().isoformat() and
+                               now.time() < cfg_squareoff(self.cfg))
+            live = open_n > 0 or session_running
+        vlabel = verdict + ("*" if live else "")
+
+        notes = []
+        if tripped:
+            notes.append(f"circuit breaker: {worst}-loss streak / day limit {limit_r:g}R")
+        if open_n:
+            notes.append("live")
+        new = {
+            "Date": date_str, "Trades": len(rows), "Wins": wins,
+            "Losses": losses, "Flats": flats, "Open": open_n,
+            "WinRatePct": f"{wr:.1f}", "NetR": f"{net_r:+.3f}",
+            "NetPnlAmt": fmt2(net_amt), "BreakerTripped": "YES" if tripped else "NO",
+            "DayVerdict": vlabel, "Notes": "; ".join(notes),
+        }
+        summary = [r for r in self._read_csv(self.summary_csv)
+                   if r.get("Date") != date_str]
+        summary.append(new)
+        summary.sort(key=lambda r: r.get("Date", ""))
+        self._write_csv(self.summary_csv, SUMMARY_COLS, summary)
+
+        # notify-once guards
+        if tripped and date_str == now.date().isoformat() and \
+                not self.state["breaker_notified"].get(date_str):
+            self.state["breaker_notified"][date_str] = True
+            self._save_state()
+            self.notify(f"⛔ CIRCUIT BREAKER {date_str}: stop trading for the "
+                        f"day (net {net_r:+.2f}R). SOP rule.")
+        final_telegram = (open_n == 0 and not live and
+                          date_str == now.date().isoformat() and
+                          now.time() >= cfg_squareoff(self.cfg) and
+                          not self.state["day_verdict_sent"].get(date_str))
+        if final_telegram:
+            self.state["day_verdict_sent"][date_str] = True
+            self._save_state()
+            self.notify(f"📊 {date_str} DAY VERDICT: {verdict} | "
+                        f"{len(closed)} trades | {wins}W/{losses}L | "
+                        f"net {net_r:+.2f}R (Rs {net_amt:+.2f})")
+        return new
+
+    def breaker_tripped_today(self, now=None):
+        now = now or now_ist()
+        for r in self._read_csv(self.summary_csv):
+            if r.get("Date") == now.date().isoformat():
+                return r.get("BreakerTripped") == "YES"
+        return False
+
+    # ---------------- catch-up / reporting ---------------------------------
+    def catch_up(self, hist_provider, now=None):
+        """Finalize OPEN trades using price history. Runs at every scanner
+        start and inside journal.py, so a PC that was switched off still
+        gets accurate outcomes and verdicts."""
+        now = now or now_ist()
+        sq = cfg_squareoff(self.cfg)
+        touched = set()
+        for t in list(self.state["open"]):
+            sym, date = t["symbol"], t["date"]
+            session_over = (date < now.date().isoformat() or
+                            (date == now.date().isoformat() and now.time() >= sq))
+            try:
+                bars = hist_provider.get_bars_history(sym, date, now=now)
+            except Exception as e:
+                print(f"[JOURNAL] history fetch failed for {sym} {date}: {e}")
+                continue
+            if not bars:
+                if session_over:
+                    print(f"[JOURNAL] no history data for {sym} {date} "
+                          f"(kept OPEN - will retry / mark manually)")
+                continue
+            res = self.on_bars(sym, bars, now=now)
+            if res:
+                touched.add(date)
+        for d in sorted(touched):
+            self.recompute_day(d, now=now)
+
+    def report(self, now=None, last_days=7):
+        """Human-readable journal report (console / Telegram digest)."""
+        now = now or now_ist()
+        today = now.date().isoformat()
+        L = []
+        L.append("=" * 66)
+        L.append(f" TRADE JOURNAL REPORT  -  {now.strftime('%Y-%m-%d %H:%M')} IST")
+        L.append("=" * 66)
+        opens = self.state["open"]
+        if opens:
+            L.append(f"OPEN TRADES ({len(opens)})")
+            for o in opens:
+                L.append(f"  {o['symbol']:<12} {o['direction']:<5} entry "
+                         f"{o['entry']} SL {o['stop']} TGT {o['target']} "
+                         f"qty {o['qty']}  [{o['date']} {o['signal_time']}]")
+        else:
+            L.append("OPEN TRADES: none")
+        trades = self._read_trades()
+        today_rows = [r for r in trades if r.get("Date") == today]
+        if today_rows:
+            s = self.recompute_day(today, now=now) or {}
+            L.append("")
+            L.append(f"TODAY ({today}): {s.get('Trades', 0)} trades | "
+                     f"{s.get('Wins', 0)}W/{s.get('Losses', 0)}L | "
+                     f"net {s.get('NetR', '0.000')}R "
+                     f"(Rs {s.get('NetPnlAmt', '0.00')})  "
+                     f"-> VERDICT: {s.get('DayVerdict', 'PENDING')}")
+        summary = [r for r in self._read_csv(self.summary_csv)][-last_days:]
+        if summary:
+            L.append("")
+            L.append(f"LAST {len(summary)} DAY(S)")
+            L.append(f"  {'Date':<12}{'Tr':>3}{'W':>3}{'L':>3}{'NetR':>9}"
+                     f"{'Rs':>10}  Verdict")
+            for r in summary:
+                L.append(f"  {r['Date']:<12}{r['Trades']:>3}{r['Wins']:>3}"
+                         f"{r['Losses']:>3}{r['NetR']:>9}{r['NetPnlAmt']:>10}"
+                         f"  {r['DayVerdict']}")
+        closed = [r for r in trades if r.get("Status") != "OPEN"]
+        if closed:
+            wr = 100.0 * sum(1 for r in closed if r["Result"] == "WIN") / len(closed)
+            tot = sum(float(r["PnL_R"] or 0) for r in closed)
+            L.append("")
+            L.append(f"OVERALL: {len(closed)} closed trades | win rate "
+                     f"{wr:.0f}% | total {tot:+.2f}R | avg {tot/len(closed):+.2f}R/trade")
+            L.append(f"(1:3 structure gross breakeven = 25% win rate; SOP net "
+                    f"breakeven ~30% incl. costs)")
+        L.append("")
+        L.append(f"files: {self.trades_csv}")
+        L.append(f"       {self.summary_csv}")
+        return "\n".join(L)
+
+def cfg_squareoff(cfg):
+    return parse_hhmm(cfg.get("squareoff", "15:10"))
+
+
+# ===========================================================================
+# SCANNER LOOP
+# ===========================================================================
+class Scanner:
+    def __init__(self, cfg, base_dir="."):
+        self.cfg = cfg
+        self.base_dir = base_dir
+        self.universe = load_universe(os.path.join(base_dir, cfg["universe_file"]))
+        if not self.universe:
+            raise SystemExit("Universe is empty - check universe_nifty100.txt")
+        self.fast = None
+        mode = str(cfg.get("data_mode", "auto")).lower()
+        if mode in ("nse", "auto"):
+            try:
+                nf = NseFast(cfg)
+                nf.warmup()
+                nf.get_snapshot()
+                self.fast = nf
+                print(f"[DATA] NSE fast lane OK ({len(self.universe)} symbols)")
+            except Exception as e:
+                if mode == "nse":
+                    print(f"[DATA] NSE unavailable ({e}); falling back to Yahoo")
+                else:
+                    print(f"[DATA] NSE blocked/failed ({e}); Yahoo-only mode")
+        self.bars = make_bar_provider(cfg)   # raises if yfinance missing
+        self.journal = TradeJournal(base_dir=base_dir, cfg=cfg,
+                                    notify=send_telegram)
+        # strategy engines
+        self.fib = FibEngine(cfg)                       # Strategy 1
+        self.s3 = (ChoChEngine(cfg, base_dir=base_dir)   # Strategy 3
+                   if cfg.get("s3_enabled", True) else None)
+        self.auto_poi = (AutoPoi(cfg, self.bars, base_dir=base_dir)
+                         if self.s3 is not None
+                         and cfg.get("s3_auto_poi", True) else None)
+        self._s3_bias = {}
+        self._s3_bias_date = None
+        self._cycle = 0
+
+    def _open_symbols(self):
+        return {o["symbol"] for o in self.journal.state["open"]}
+
+    def _entries_allowed(self, now):
+        """SOP 3.4 / Phase V discipline: 3-entry cap, 2 concurrent positions."""
+        today = now.date().isoformat()
+        day_n = sum(1 for r in self.journal._read_trades()
+                    if r.get("Date") == today)
+        open_n = len(self.journal.state["open"])
+        if day_n >= int(self.cfg.get("max_trades_per_day", 3)):
+            return False, f"daily entry cap reached ({day_n} trades today)"
+        if open_n >= int(self.cfg.get("max_concurrent_positions", 2)):
+            return False, f"max concurrent positions held ({open_n})"
+        return True, ""
+
+    def run_once(self, now=None):
+        now = now or now_ist()
+        if now.weekday() >= 5:
+            print(f"[SCAN] {now.strftime('%a %H:%M')} - weekend, market closed")
+            return
+        quotes = {}
+        if self.fast is not None:
+            try:
+                quotes = self.fast.get_quotes(self.universe)
+            except NseBlockedError as e:
+                print(f"[DATA] NSE now blocked ({e}); switching to Yahoo-only")
+                self.fast = None
+
+        # symbols that need bar data: NSE candidates + open trades + S1
+        # watch-list + a rotating slice so every symbol is bar-checked
+        # periodically even in NSE fast-lane mode (S1 pullbacks happen away
+        # from the day high, where candidate detection cannot see them)
+        if quotes:
+            need = (fast_candidates(quotes) | self._open_symbols()
+                    | self.fib.watch)
+            rs = int(self.cfg.get("rotate_slice", 25) or 0)
+            if rs > 0:
+                seg = (self._cycle * rs) % len(self.universe)
+                need |= set(self.universe[seg:seg + rs])
+            self._cycle += 1
+        else:
+            need = set(self.universe) | self._open_symbols() | self.fib.watch
+        bars = self.bars.get_bars(sorted(need), now=now)
+
+        # 1) journal maintenance on fresh bars (outcomes first, always)
+        for sym in sorted(bars):
+            self.journal.on_bars(sym, bars[sym], now=now)
+        if quotes:
+            for sym, q in quotes.items():
+                if sym in self._open_symbols():
+                    self.journal.on_quote(sym, q, now=now)
+
+        # 2) fresh signals (suppressed after the daily circuit breaker)
+        fresh = []
+        if self.journal.breaker_tripped_today(now=now):
+            print("[SOP] CIRCUIT BREAKER active for today - "
+                  "no new entries, open trades still monitored")
+        else:
+            # Strategy 3 first (own data flow: POI zones, 15m/60m, bias)
+            fresh += self._scan_s3(now)
+            ok, why = self._entries_allowed(now)
+            if ok:
+                for sym in sorted(bars):
+                    b = bars[sym]
+                    sig = None
+                    if self.cfg.get("s1_enabled", True):
+                        sig = self.fib.update(sym, b)      # Strategy 1
+                    if sig is None:
+                        sig = check_s2(sym, b, self.cfg)   # Strategy 2
+                    if sig:
+                        fresh.append(sig)
+            else:
+                print(f"[SOP] {why} - no new entries")
+        for sig in fresh:
+            if sig.symbol in self._open_symbols():
+                continue        # SOP 3.4: one position per instrument
+            ok, _ = self._entries_allowed(now)
+            if not ok:
+                break
+            tid = self.journal.record_signal(sig)
+            if tid:
+                self._alert(sig)
+
+        # 3) status line
+        self._status_line(now)
+
+    def _scan_s3(self, now):
+        """Strategy 3 data flow: auto-POI zones -> W1/D1 bias -> 15m/60m."""
+        if not (self.cfg.get("s3_enabled", True) and self.s3 is not None):
+            return []
+        # SOP Step 3, automated: build today's H4 zone map if not done yet
+        if self.auto_poi is not None:
+            try:
+                res = self.auto_poi.ensure_today(self.universe, now,
+                                                 bias_of=self.s3.bias_of)
+                if res is not None:
+                    n, n_sym = res
+                    send_telegram(
+                        f"\U0001f4cd S3 auto-POI for {now.date().isoformat()}: "
+                        f"{n} fresh H4 zone(s) on {n_sym} symbol(s) after "
+                        f"W1/D1 bias alignment. Strategy 3 watchlist ready.")
+            except Exception as e:
+                print(f"[S3] auto-POI generation failed ({e}); manual "
+                      f"{self.s3.poi_path} still honoured")
+        self.s3.reload_zones()
+        zones = {s: z for s, z in self.s3.zones.items() if s in self.universe}
+        if not zones:
+            return []
+        syms = sorted(zones)
+        today = now.date().isoformat()
+        if self._s3_bias_date != today:
+            try:
+                daily = self.bars.get_daily(syms, now=now)
+                self._s3_bias = {s: self.s3.bias_of(s, daily.get(s))
+                                 for s in syms}
+                self._s3_bias_date = today
+                n = sum(1 for v in self._s3_bias.values() if v)
+                print(f"[S3] W1/D1 bias: {n}/{len(syms)} zone symbol(s) "
+                      f"aligned; the rest are no-trade today (SOP Step 2)")
+            except Exception as e:
+                print(f"[S3] daily data unavailable ({e}); Strategy 3 paused")
+                self._s3_bias, self._s3_bias_date = {}, today
+        if not self._s3_bias:
+            return []
+        try:
+            m15 = self.bars.get_intraday(syms, "15m", "2d", now=now)
+            h1 = self.bars.get_intraday(syms, "60m", "5d", now=now)
+        except Exception as e:
+            print(f"[S3] intraday fetch failed: {e}")
+            return []
+        out = []
+        for s in syms:
+            sig = self.s3.update(s, zones[s], self._s3_bias.get(s),
+                                 m15.get(s, []), h1.get(s, []), now)
+            if sig:
+                out.append(sig)
+        return out
+
+    def _alert(self, sig):
+        arrow = "🟢 LONG" if sig.direction == "LONG" else "🔴 SHORT"
+        msg = (f"{arrow} CONFIRMED | {sig.symbol} | {sig.date} {sig.sig_time} IST\n"
+               f"setup {sig.setup} | entry {sig.entry:.2f} | SL {sig.stop:.2f} | "
+               f"TGT {sig.target:.2f} ({self.cfg.get('rr', 3.0):g}R) | "
+               f"qty {sig.qty} | risk Rs {sig.risk_amt:.2f}\n"
+               f"{sig.note}\n"
+               f"VERIFY in broker terminal + SOP 12-point checklist first.")
+        print("\n" + "!" * 66)
+        print(msg)
+        print("!" * 66 + "\n")
+        send_telegram(msg)
+
+    def _status_line(self, now):
+        rows = [r for r in self.journal._read_trades()
+                if r.get("Date") == now.date().isoformat()]
+        open_n = len(self.journal.state["open"])
+        closed = [r for r in rows if r.get("Status") != "OPEN"]
+        net = sum(float(r["PnL_R"] or 0) for r in closed)
+        wins = sum(1 for r in closed if r["Result"] == "WIN")
+        losses = sum(1 for r in closed if r["Result"] == "LOSS")
+        verdict = "PENDING"
+        s = self.journal.recompute_day(now.date().isoformat(), now=now)
+        if s:
+            verdict = s.get("DayVerdict", "PENDING")
+        print(f"[{now.strftime('%H:%M')}] signals today: {len(rows)} "
+              f"({wins}W/{losses}L, {open_n} open) | day: {net:+.2f}R "
+              f"| verdict: {verdict}")
+
+    def run(self):
+        n_zones = sum(len(v) for v in (self.s3.zones if self.s3 else {}).values())
+        print(f"[SCANNER v{VERSION}] {len(self.universe)} symbols | mode="
+              f"{('nse+yahoo' if self.fast else 'yahoo')} | journal="
+              f"{self.journal.dir}")
+        print(f"[SCANNER] strategies: S1 fib="
+              f"{'ON' if self.cfg.get('s1_enabled', True) else 'off'} | "
+              f"S2 momentum | S3 choch="
+              f"{'ON' if self.s3 else 'off'} ({n_zones} POI zones, "
+              f"auto-POI={'ON' if self.auto_poi is not None else 'off'})")
+        print("[SCANNER] alerts only - it never places orders.")
+        # back-fill anything the last session missed
+        try:
+            self.journal.catch_up(self.bars)
+        except Exception as e:
+            print(f"[JOURNAL] catch-up failed: {e}")
+        interval = int(self.cfg.get("scan_interval_min", 5))
+        sq_time = cfg_squareoff(self.cfg)
+        alert_time = self.cfg.get("squareoff_alert_t") or parse_hhmm("15:05")
+        exit_time = self.cfg.get("exit_after_t") or parse_hhmm("15:35")
+
+        while True:
+            now = now_ist()
+            if now.weekday() >= 5:
+                print("[SCANNER] weekend - market closed. Exiting; "
+                      "journal state saved.")
+                break
+            # AUTOMATION: stop scanning at/after the square-off time
+            if now.time() >= sq_time or now.time() >= exit_time:
+                print(f"\n[SOP] Time is {now.strftime('%H:%M')}. Reached "
+                      f"square-off time ({sq_time.strftime('%H:%M')}).")
+                print("[SOP] Stopping scans to process EOD square-offs.")
+                break
+            # 15:05 heads-up / square-off directive (once per day)
+            today = now.date().isoformat()
+            if (alert_time <= now.time() < sq_time
+                    and not self.journal.state["squareoff_alert_sent"]
+                    .get(today)):
+                self.journal.state["squareoff_alert_sent"][today] = True
+                self.journal._save_state()
+                n_open = len(self.journal.state["open"])
+                send_telegram(
+                    f"⏰ {today} {alert_time.strftime('%H:%M')} IST - "
+                    f"SQUARE-OFF DIRECTIVE: close all {n_open} open MIS "
+                    f"position(s) NOW. Auto square-off at "
+                    f"{sq_time.strftime('%H:%M')}; no new entries from here.")
+                print("[SOP] square-off directive sent")
+            self.run_once(now=now)
+            target = now.replace(second=0, microsecond=0)
+            target += timedelta(minutes=(interval - target.minute % interval))
+            wait = (target - now_ist()).total_seconds() + 5
+            print(f"[SCANNER] next scan at {target.strftime('%H:%M')} "
+                  f"(sleeping {max(wait, 5):.0f}s)")
+            try:
+                time.sleep(max(wait, 5))
+            except KeyboardInterrupt:
+                print("\n[SCANNER] stopped by user. Journal state saved.")
+                break
+
+    # ---------------- EOD square-off automation --------------------------
+    def run_eod(self):
+        """15:10 flow: square off every OPEN trade in the journal, refresh
+        the day verdicts, print the final report. Runs after the scan loop
+        breaks (local) and after --once when started past the cutoff."""
+        now = now_ist()
+        print("\n" + "=" * 66)
+        print(f"[SOP] automated end-of-session processing at "
+              f"{now.strftime('%H:%M')} IST")
+        # 1) history-based square-off + verdict refresh
+        try:
+            self.journal.catch_up(self.bars, now=now)
+        except Exception as e:
+            print(f"[JOURNAL] catch-up failed ({e})")
+            send_telegram(f"⚠️ EOD journal update issue: {e}")
+        # 2) belt-and-braces: force square-off anything still OPEN
+        try:
+            self._force_squareoff(now=now)
+        except Exception as e:
+            print(f"[JOURNAL] force square-off failed: {e}")
+        # 3) final report
+        print("\n" + self.journal.report(now=now))
+        print("\n[SOP] EOD square-off + journal update complete.")
+
+    def _force_squareoff(self, now=None):
+        """Finalize today's still-OPEN trades at the best known price:
+        NSE LTP first (fresh print), then the last closed 5m bar. Trades
+        that cannot be priced stay OPEN and are flagged for journal.py."""
+        now = now or now_ist()
+        opens = list(self.journal.state["open"])
+        if not opens:
+            return
+        syms = sorted({o["symbol"] for o in opens})
+        today = now.date().isoformat()
+        quotes = {}
+        if self.fast is not None:
+            try:
+                quotes = self.fast.get_quotes(syms)
+            except Exception:
+                quotes = {}
+        try:
+            bars = self.bars.get_bars(syms, now=now)
+        except Exception as e:
+            print(f"[JOURNAL] fresh-bar fetch failed ({e})")
+            bars = {}
+        left = []
+        for o in opens:
+            done = False
+            if o["date"] == today:
+                ltp = float((quotes.get(o["symbol"]) or {}).get("ltp") or 0)
+                if ltp > 0:
+                    self.journal.finalize(o, ltp, "EOD_SQUAREOFF", now,
+                                          "NSE LTP")
+                    done = True
+            if not done:
+                got = bars.get(o["symbol"])
+                if got:
+                    self.journal.on_bars(o["symbol"], got, now=now)
+            if any(x["trade_id"] == o["trade_id"]
+                   for x in self.journal.state["open"]):
+                left.append(o["trade_id"])
+        if left:
+            print(f"[JOURNAL] {len(left)} trade(s) could not be priced - "
+                  f"kept OPEN: {', '.join(left)}")
+            send_telegram("⚠️ EOD square-off: " + ", ".join(left) +
+                          " not priced (run UPDATE_JOURNAL / journal.py)")
+        self.journal.recompute_day(now.date().isoformat(), now=now)
+
+
+# ===========================================================================
+# SELF TESTS
+# ===========================================================================
+def _mk_bars(day, spec, start="09:15"):
+    t0 = datetime.strptime(f"{day} {start}", "%Y-%m-%d %H:%M").replace(tzinfo=IST)
+    return [Bar(t0 + timedelta(minutes=5 * i), o, h, l, c, v)
+            for i, (o, h, l, c, v) in enumerate(spec)]
+
+
+def _mk_bars_step(day, spec, start="09:15", step=5):
+    t0 = datetime.strptime(f"{day} {start}", "%Y-%m-%d %H:%M").replace(tzinfo=IST)
+    return [Bar(t0 + timedelta(minutes=step * i), o, h, l, c, v)
+            for i, (o, h, l, c, v) in enumerate(spec)]
+
+
+def _trend_spec(n, start_o=99.0, step=0.02, vol=5000):
+    """n gently-rising bars; returns [(o,h,l,c,v)...] with a rising
+    structure that alone does NOT trigger (no volume spike)."""
+    spec = []
+    for i in range(n):
+        o = start_o + step * i
+        c = o + 0.05
+        spec.append((round(o, 2), round(c + 0.10, 2), round(o - 0.10, 2),
+                     round(c, 2), vol))
+    return spec
+
+
+SPIKE = (101.90, 103.00, 101.70, 102.90, 150000)   # S2 long signal bar
+BASE_BARS = _trend_spec(45) + [SPIKE]
+
+
+def _test_cfg(tmp, **over):
+    cfg = deep_merge(DEFAULT_CONFIG, {"journal": {"folder": "journal"}})
+    cfg["scan_start_t"] = parse_hhmm(cfg["scan_start"])
+    cfg["entry_cutoff_t"] = parse_hhmm(cfg["entry_cutoff"])
+    cfg["squareoff_t"] = parse_hhmm(cfg["squareoff"])
+    cfg["squareoff_alert_t"] = parse_hhmm(cfg["squareoff_alert"])
+    cfg["exit_after_t"] = parse_hhmm(cfg["exit_after"])
+    cfg.update(over)
+    return cfg
+
+
+class FakeHist:
+    def __init__(self, bars_by_date):
+        self.d = bars_by_date
+
+    def get_bars_history(self, symbol, date_str, now=None):
+        return self.d.get((symbol, date_str), [])
+
+
+def _sig_for(cfg, bars, symbol="TEST"):
+    return check_signal(symbol, bars, cfg)
+
+
+def test_config_merge():
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "config.json")
+    with open(p, "w") as f:
+        json.dump({"capital": 50000, "journal": {"daily_loss_limit_R": -1.0},
+                   "squareoff_alert": "15:00"}, f)
+    cfg = load_config(p)
+    assert cfg["capital"] == 50000
+    assert cfg["journal"]["daily_loss_limit_R"] == -1.0
+    assert cfg["journal"]["max_consecutive_losses"] == 2      # default merged
+    assert cfg["rr"] == 3.0
+    assert cfg["max_price"] == 2000 and cfg["min_bar_volume"] == 100000
+    assert cfg["squareoff_alert_t"] == parse_hhmm("15:00")    # user override
+    assert cfg["exit_after_t"] == parse_hhmm("15:35")         # default
+
+
+def test_journal_autocreate():
+    import tempfile
+    d = tempfile.mkdtemp()
+    j = TradeJournal(base_dir=d, cfg=_test_cfg(d), notify=None)
+    assert os.path.exists(j.trades_csv) and os.path.exists(j.summary_csv)
+    assert os.path.exists(j.state_json)
+    head = open(j.trades_csv, encoding="utf-8").readline().strip()
+    assert head.split(",")[0] == "TradeID" and "Result" in head
+
+
+def test_rsi_atr_helpers():
+    up = [100.0 + i for i in range(30)]
+    assert rsi_series(up, 14)[-1] > 85
+    dn = [200.0 - i for i in range(30)]
+    assert rsi_series(dn, 14)[-1] < 15
+    assert rsi_series([100.0] * 5, 14) == [None] * 5          # too short
+    bars = _mk_bars("2026-01-05", [(100.0, 101.0, 99.0, 100.0, 1000)] * 20)
+    a = atr_series(bars, 14)
+    assert a[-1] is not None and abs(a[-1] - 2.0) < 0.3
+    assert atr_series(bars[:5], 14)[-1] is None               # seed window
+
+
+def test_record_and_dedup():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    bars = _mk_bars("2026-01-05", BASE_BARS)
+    sig = _sig_for(cfg, bars)
+    assert sig is not None and sig.direction == "LONG", "expected LONG signal"
+    assert sig.setup == "S2_BREAKOUT"
+    tid = j.record_signal(sig)
+    assert tid and j.has_trade(tid)
+    assert j.record_signal(sig) is None, "duplicate must be rejected"
+    rows = j._read_trades()
+    assert len(rows) == 1 and rows[0]["Status"] == "OPEN"
+    assert rows[0]["Entry"] == "103.05"          # signal high + 1 tick
+    assert abs(sig.stop - 101.65) < 1e-9         # signal low - 1 tick
+    assert abs(sig.target - 107.25) < 0.051      # 1:3 from the stop order
+    risk_amt = cfg["capital"] * cfg["risk_pct"] / 100.0
+    assert sig.qty == int(risk_amt // (103.05 - 101.65))
+
+
+def test_long_target_win():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    sig = _sig_for(cfg, bars)
+    j.record_signal(sig)
+    # next bar rallies through the target
+    bars2 = bars + _mk_bars(day, [(102.9, 107.6, 102.6, 107.3, 20000)], start="13:10")
+    j.on_bars("TEST", bars2, now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Status"] == "CLOSED" and row["Result"] == "WIN"
+    assert row["ExitReason"] == "TARGET_HIT"
+    assert abs(float(row["PnL_R"]) - 3.0) < 0.05, row["PnL_R"]
+    s = j.recompute_day(day, now=datetime(2026, 1, 5, 15, 20, tzinfo=IST))
+    assert s["DayVerdict"] == "SUCCESS" and s["Open"] == 0  # final after squareoff
+
+
+def test_long_stop_loss():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    sig = _sig_for(cfg, bars)
+    j.record_signal(sig)
+    bars2 = bars + _mk_bars(day, [(102.8, 102.9, 101.0, 101.2, 20000)], start="13:10")
+    j.on_bars("TEST", bars2, now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Result"] == "LOSS" and row["ExitReason"] == "STOP_HIT"
+    assert abs(float(row["PnL_R"]) + 1.0) < 0.02
+
+
+def test_short_mirror():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    spec = []
+    for i in range(45):                      # gentle downtrend
+        o = 101.0 - 0.02 * i
+        c = o - 0.05
+        spec.append((round(o, 2), round(c + 0.10, 2), round(o - 0.10, 2),
+                     round(c, 2), 5000))
+    bars = _mk_bars(day, spec + [(99.60, 99.75, 98.60, 98.75, 150000)])
+    sig = _sig_for(cfg, bars)
+    assert sig is not None and sig.direction == "SHORT", "expected SHORT signal"
+    assert sig.setup == "S2_BREAKDOWN"
+    assert sig.stop > bars[-1].high          # mirrored SL above the bar high
+    assert abs(sig.entry - 98.55) < 1e-9     # sell stop: low - 1 tick
+    assert abs(sig.target - 94.80) < 0.051   # 1:3 below the sell stop
+    j.record_signal(sig)
+    bars2 = bars + _mk_bars(day, [(98.7, 98.8, 94.6, 94.7, 20000)], start="13:10")
+    j.on_bars("TEST", bars2, now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Result"] == "WIN" and row["ExitReason"] == "TARGET_HIT"
+
+
+def test_same_bar_conservative_loss():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    j.record_signal(_sig_for(cfg, bars))
+    # one wild bar that touches BOTH stop and target
+    bars2 = bars + _mk_bars(day, [(102.9, 108.0, 101.0, 103.0, 90000)], start="13:10")
+    j.on_bars("TEST", bars2, now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Result"] == "LOSS" and row["ExitReason"] == "STOP_HIT"
+    assert "conservative" in row["Notes"]
+
+
+def test_eod_squareoff():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    j.record_signal(_sig_for(cfg, bars))
+    # drifts sideways, nothing hit; now=15:12 (past 15:10) -> square off at
+    # the last available close (13:15 in this synthetic series)
+    bars2 = bars + _mk_bars(day, [(102.95, 103.15, 102.85, 103.05, 900)] * 2,
+                            start="13:10")
+    j.on_bars("TEST", bars2, now=datetime(2026, 1, 5, 15, 12, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Status"] == "CLOSED" and row["ExitReason"] == "EOD_SQUAREOFF"
+    assert row["ExitTime"] == "13:15"
+    assert row["Result"] == "FLAT"        # exit at entry -> zero P&L
+
+
+def test_catch_up_backfill():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    j.record_signal(_sig_for(cfg, bars))
+    assert len(j.state["open"]) == 1
+    # simulate: PC was off; next morning the target had been hit
+    hist = FakeHist({("TEST", day): bars +
+                     _mk_bars(day, [(102.9, 107.6, 102.6, 107.3, 20000)], start="13:10")})
+    j.catch_up(hist, now=datetime(2026, 1, 6, 9, 0, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Status"] == "CLOSED" and row["Result"] == "WIN"
+    assert j.state["open"] == []
+    s = [r for r in j._read_csv(j.summary_csv) if r["Date"] == day][0]
+    assert s["DayVerdict"] == "SUCCESS"
+
+
+def test_day_verdicts_and_breaker():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+
+    def base_bars():
+        return _mk_bars(day, BASE_BARS)
+
+    def loss_bars():
+        return base_bars() + _mk_bars(day, [(102.8, 102.9, 101.0, 101.2, 20000)],
+                                      start="13:10")
+
+    def win_bars():
+        return base_bars() + _mk_bars(day, [(102.9, 107.6, 102.6, 107.3, 20000)],
+                                      start="13:10")
+
+    # trade 1: LOSS -> day verdict FAILED while session still running
+    j.record_signal(_sig_for(cfg, base_bars()))
+    j.on_bars("TEST", loss_bars(), now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    s = j.recompute_day(day, now=datetime(2026, 1, 5, 13, 30, tzinfo=IST))
+    assert s["DayVerdict"] == "FAILED*", s["DayVerdict"]
+
+    # trade 2: second consecutive LOSS -> 2-loss streak trips the breaker
+    sig2 = check_signal("TEST2", base_bars(), cfg)
+    j.record_signal(sig2)
+    j.on_bars("TEST2", loss_bars(), now=datetime(2026, 1, 5, 13, 40, tzinfo=IST))
+    s = j.recompute_day(day, now=datetime(2026, 1, 5, 15, 20, tzinfo=IST))
+    assert s["BreakerTripped"] == "YES" and s["DayVerdict"] == "FAILED"
+    assert j.breaker_tripped_today(now=datetime(2026, 1, 5, 15, 20, tzinfo=IST))
+
+    # a winning day -> SUCCESS (final, after square-off time)
+    d2 = tempfile.mkdtemp()
+    j2 = TradeJournal(base_dir=d2, cfg=_test_cfg(d2), notify=None)
+    j2.record_signal(_sig_for(cfg, base_bars()))
+    j2.on_bars("TEST", win_bars(), now=datetime(2026, 1, 5, 13, 20, tzinfo=IST))
+    s2 = j2.recompute_day(day, now=datetime(2026, 1, 5, 15, 20, tzinfo=IST))
+    assert s2["DayVerdict"] == "SUCCESS" and s2["Wins"] == 1
+
+    # a breakeven day -> FLAT
+    d3 = tempfile.mkdtemp()
+    j3 = TradeJournal(base_dir=d3, cfg=_test_cfg(d3), notify=None)
+    j3.record_signal(_sig_for(cfg, base_bars()))
+    j3.on_bars("TEST", base_bars() + _mk_bars(day, [(103.0, 103.2, 102.9, 103.05, 900)],
+                                              start="13:10"),
+               now=datetime(2026, 1, 5, 15, 12, tzinfo=IST))
+    s3 = j3.recompute_day(day, now=datetime(2026, 1, 5, 15, 20, tzinfo=IST))
+    assert s3["DayVerdict"] == "FLAT"
+
+
+def test_state_rebuild_from_csv():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    j.record_signal(_sig_for(cfg, bars))
+    os.remove(j.state_json)                   # simulate lost state file
+    j2 = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    assert len(j2.state["open"]) == 1, "state must rebuild from CSV"
+
+
+def test_entry_cutoff_and_gates():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    good = _mk_bars("2026-01-05", BASE_BARS)
+    assert _sig_for(cfg, good) is not None
+    # after 13:30 -> blocked (same breakout bar, timestamped 13:35)
+    late = _mk_bars("2026-01-05", _trend_spec(45))
+    late.append(Bar(late[-1].ts + timedelta(minutes=5), 101.2, 103.0,
+                    101.1, 102.9, 150000))          # ts = 13:35
+    assert _sig_for(cfg, late) is None, "entry cutoff must block late signals"
+    # low relative volume -> blocked
+    quiet = _mk_bars("2026-01-05", _trend_spec(45) +
+                     [(101.20, 103.00, 101.10, 102.90, 5500)])
+    assert _sig_for(cfg, quiet) is None
+    # stale day (tiny range) -> blocked
+    stale = _mk_bars("2026-01-05", [(100.0, 100.05, 99.98, 100.02, 5000)] * 46)
+    assert _sig_for(cfg, stale) is None
+
+
+def test_quote_fast_check():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    day = "2026-01-05"
+    bars = _mk_bars(day, BASE_BARS)
+    j.record_signal(_sig_for(cfg, bars))
+    # LTP beyond target is a real print -> WIN without any bar
+    q = {"ltp": 109.0, "high": 109.0, "low": 102.0}
+    j.on_quote("TEST", q, now=datetime(2026, 1, 5, 12, 0, tzinfo=IST))
+    row = j._read_trades()[0]
+    assert row["Result"] == "WIN"
+
+
+def test_s2_min_stop_gate():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    # breakout with a noise-dominated stop (< max(0.30%, 1.5xATR)) -> skip
+    tight = _mk_bars("2026-01-05", _trend_spec(45) +
+                     [(102.00, 102.20, 102.00, 102.17, 150000)])
+    assert _sig_for(cfg, tight) is None, "min-stop gate must reject tight bars"
+
+
+def _s1_spec():
+    """A clean S1 Type-01 day: impulse A(99.80)->B(101.00), pullback C
+    (100.15), activation close above Level 1 (101.35), swing high B2
+    (102.05), pullback into the golden pocket [100.88, 101.10], 2R+1G."""
+    return [
+        (100.00, 100.05, 99.95, 100.00, 8000),   # 0-3: A pivot low @ 1
+        (99.95, 100.00, 99.80, 99.90, 8000),
+        (99.90, 99.98, 99.82, 99.94, 8000),
+        (99.95, 100.10, 99.90, 100.05, 8000),
+        (100.00, 100.20, 99.95, 100.15, 8000),   # 4-8: impulse to B @ 8
+        (100.20, 100.40, 100.15, 100.35, 8000),
+        (100.40, 100.60, 100.35, 100.55, 8000),
+        (100.60, 100.80, 100.55, 100.75, 8000),
+        (100.80, 101.00, 100.75, 100.95, 8000),
+        (100.90, 100.95, 100.55, 100.60, 8000),   # 9-11: pullback to C @ 11
+        (100.60, 100.65, 100.30, 100.35, 8000),
+        (100.35, 100.40, 100.15, 100.20, 8000),
+        (100.20, 100.60, 100.20, 100.55, 8000),   # 12-14: recovery
+        (100.55, 101.00, 100.50, 100.95, 8000),
+        (100.95, 101.40, 100.90, 101.35, 8000),   # touches L1, no close yet
+        (101.35, 101.85, 101.30, 101.80, 8000),   # 15: ACTIVATION close
+        (101.80, 102.00, 101.75, 101.95, 8000),   # 16-17: swing high B2
+        (101.95, 102.05, 101.90, 102.00, 8000),
+        (101.95, 102.00, 101.60, 101.65, 8000),   # 18-19: pullback starts
+        (101.65, 101.70, 101.25, 101.30, 8000),
+        (101.25, 101.30, 100.95, 101.00, 8000),   # 20-21: two reds in pocket
+        (101.00, 101.05, 100.80, 100.85, 8000),
+        (100.85, 101.20, 100.80, 101.15, 8000),   # 22: green in pocket
+    ]
+
+
+def test_s1_fib_t01():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    fib = FibEngine(cfg)
+    day = "2026-01-05"
+    bars = _mk_bars(day, _s1_spec())
+    assert fib.update("TEST", bars) is None, "no trigger break yet"
+    # the next bar trades through the buy stop (green high 101.20 + 1 tick)
+    bars2 = bars + _mk_bars(day, [(101.15, 101.35, 101.10, 101.30, 8000)],
+                            start="11:10")
+    sig = fib.update("TEST", bars2)
+    assert sig is not None, "S1 Type-01 signal expected"
+    assert sig.setup == "S1_FIB_T01" and sig.direction == "LONG"
+    assert abs(sig.entry - 101.25) < 1e-9      # green high + 1 tick
+    assert abs(sig.stop - 100.75) < 1e-9       # green low - 1 tick
+    assert abs(sig.target - 102.75) < 0.051    # 1:3
+    assert sig.qty == int(62.50 // 0.50)
+    assert sig.sig_time == "11:10"             # filled on the break bar
+
+
+def test_s1_trigger_expiry():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    fib = FibEngine(cfg)
+    day = "2026-01-05"
+    # five quiet bars after the green candle -> SOP 5-bar trigger expiry
+    bars = _mk_bars(day, _s1_spec()) + \
+        _mk_bars(day, [(101.15, 101.20, 101.00, 101.05, 8000)] * 5,
+                 start="11:10")
+    assert fib.update("TEST", bars) is None, "expired trigger must be void"
+
+
+def test_s3_zone_flow():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    eng = ChoChEngine(cfg, base_dir=d)         # empty poi file -> no zones
+    assert eng.zones == {}
+    eng.zones = {"TEST": [
+        {"side": "LONG", "low": 100.20, "high": 102.00, "date": ""},
+        {"side": "SHORT", "low": 106.00, "high": 107.00, "date": ""},
+    ]}
+    day = "2026-01-05"
+    m15 = _mk_bars_step(day, [
+        (103.00, 103.10, 102.60, 102.70, 1000),
+        (102.70, 102.80, 102.20, 102.30, 1000),
+        (102.30, 102.40, 101.60, 101.70, 1000),   # first tap of the zone
+        (101.70, 101.80, 101.20, 101.30, 1000),   # deeper tap
+        (101.45, 101.65, 101.40, 101.60, 1000),   # M15 confirm close
+    ], step=15)
+    h1 = _mk_bars_step(day, [
+        (101.80, 101.90, 101.50, 101.55, 5000),   # small red bar at the zone
+        (101.40, 102.30, 101.20, 102.25, 5000),   # bullish engulfing
+    ], step=60)
+    sig = eng.update("TEST", eng.zones["TEST"], "BULL", m15, h1,
+                     datetime(2026, 1, 5, 10, 20, tzinfo=IST))
+    assert sig is not None, "S3 signal expected at the demand POI"
+    assert sig.setup == "S3_CHOCH" and sig.direction == "LONG"
+    assert abs(sig.entry - 101.60) < 1e-9       # the M15 confirm close
+    assert abs(sig.stop - 100.15) < 1e-9        # POI extreme - 1 tick
+    assert abs(sig.target - 106.00) < 1e-9      # nearest opposing POI (>= 2R)
+    assert sig.qty == int(62.50 // 1.45)        # Phase V sizing
+    # bearish bias -> demand zone not tradable (SOP Step 2)
+    assert eng.update("TEST", eng.zones["TEST"], "BEAR", m15, h1,
+                      datetime(2026, 1, 5, 10, 20, tzinfo=IST)) is None
+
+
+def test_s3_bias_structure():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    eng = ChoChEngine(cfg, base_dir=d)
+    day0 = datetime(2025, 10, 6, 9, 15, tzinfo=IST)
+
+    def daily(seq):
+        return [Bar(day0 + timedelta(days=i), v, v, v, v, 1000)
+                for i, v in enumerate(seq)]
+
+    up = [100.0 + (i % 4) * 0.4 + i * 0.05 for i in range(80)]
+    dn = [200.0 - ((i % 4) * 0.4 + i * 0.05) for i in range(80)]
+    assert eng.bias_of("T", daily(up)) == "BULL"
+    assert eng.bias_of("T", daily(dn)) == "BEAR"
+    assert eng.bias_of("T", daily(up[:40])) is None    # too little history
+
+
+def test_entries_allowed_caps():
+    sc = Scanner.__new__(Scanner)          # skip __init__ (no network)
+    sc.cfg = _test_cfg(".", max_trades_per_day=2, max_concurrent_positions=1)
+
+    class FakeJ:
+        state = {"open": [{"symbol": "X"}]}
+
+        @staticmethod
+        def _read_trades():
+            return [{"Date": "2026-01-05"}, {"Date": "2026-01-05"}]
+
+    sc.journal = FakeJ()
+    now = datetime(2026, 1, 5, 11, 0, tzinfo=IST)
+    ok, why = sc._entries_allowed(now)
+    assert not ok and "cap" in why         # 3-entry cap (2 reached)
+    sc.cfg["max_trades_per_day"] = 5
+    ok, why = sc._entries_allowed(now)
+    assert not ok and "concurrent" in why  # 2-position cap (1 held)
+    sc.cfg["max_concurrent_positions"] = 3
+    ok, _ = sc._entries_allowed(now)
+    assert ok
+
+
+# ------------------------- AutoPoi tests ----------------------------------
+def _h1_session(day, closes, wick=0.12, vol=5000):
+    """Six 1h bars (09:15..15:15 IST) walking through `closes`."""
+    times = ["09:15", "10:15", "11:15", "12:15", "13:15", "14:15", "15:15"]
+    bars = []
+    o = closes[0] - (closes[0] * 0)  # first bar opens at given level
+    seq = closes
+    for i, c in enumerate(seq):
+        t0 = datetime.strptime(f"{day} {times[i]}", "%Y-%m-%d %H:%M")
+        bars.append(Bar(t0.replace(tzinfo=IST), o,
+                        max(o, c) + wick, min(o, c) - wick, c, vol))
+        o = c
+    return bars
+
+
+def _auto_poi_cfg(tmp, **over):
+    cfg = _test_cfg(tmp, **over)
+    cfg["poi_auto_file"] = "poi_zones_auto.csv"
+    cfg["s3_poi_lookback_days"] = 30
+    cfg["s3_poi_max_zone_pct"] = 2.0
+    cfg["s3_poi_proximity_pct"] = 20.0   # wide for the synthetic series
+    cfg["s3_poi_max_per_side"] = 2
+    return cfg
+
+
+class FakeProv:
+    """Minimal provider double for AutoPoi tests."""
+
+    def __init__(self, h1_by_sym, daily_by_sym=None):
+        self.h1 = h1_by_sym
+        self.daily = daily_by_sym or {}
+        self.h1_calls = 0
+
+    def get_intraday(self, symbols, interval="15m", period="5d", now=None):
+        self.h1_calls += 1
+        return {s: list(self.h1.get(s, [])) for s in symbols}
+
+    def get_daily(self, symbols, period="1y", now=None):
+        return {s: list(self.daily.get(s, [])) for s in symbols}
+
+
+def _swing_series(rally_over=False):
+    """12 sessions: down into ~399 (swing low), up into ~441 (swing
+    high), then mild drift. rally_over=True closes through the high."""
+    sessions = ["2026-01-01", "2026-01-02", "2026-01-05", "2026-01-06",
+                "2026-01-07", "2026-01-08", "2026-01-09", "2026-01-12",
+                "2026-01-13", "2026-01-14", "2026-01-15", "2026-01-16"]
+    path = []                       # per-session six 1h closes
+    px = 430.0
+    for i in range(12):
+        if i < 3:                   # decline into the swing low (~399)
+            step = -3.4
+        elif i < 8:                 # rally into the swing high (~441)
+            step = +2.78
+        else:                       # mild drift under the high
+            step = -0.4
+        closes = [round(px + step * (j + 1) * 0.5, 2) for j in range(7)]
+        closes = [px] + closes[:6]
+        px = closes[-1]
+        path.append((sessions[i], closes))
+    bars = []
+    for day, closes in path:
+        bars += _h1_session(day, closes)
+    if rally_over:
+        for k, day in enumerate(["2026-01-19", "2026-01-20"]):
+            closes = [442.0 + k, 444.0 + k, 446.0 + k, 448.0 + k,
+                      450.0 + k, 452.0 + k, 454.0 + k]
+            bars += _h1_session(day, closes)
+    return bars
+
+
+def test_auto_poi_h4_and_zones():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _auto_poi_cfg(d)
+    ap = AutoPoi(cfg, FakeProv({"TEST": _swing_series()}), base_dir=d)
+    now = datetime(2026, 1, 22, 9, 30, tzinfo=IST)   # a Friday, after data
+    h1 = ap.provider.get_intraday(["TEST"], "60m", "60d", now=now)
+    h4 = ap._h4_buckets(h1["TEST"])
+    assert len(h4) == 24, f"12 sessions -> 24 H4 bars, got {len(h4)}"
+    b0 = h4[0]
+    assert b0.ts.hour == 9 and b0.ts.minute == 15    # bucket A anchor
+    zs = ap._zones_from_h4(h4)
+    sides = {z["side"] for z in zs}
+    assert "LONG" in sides and "SHORT" in sides, f"zones {zs}"
+    for z in zs:
+        assert set(z) == {"side", "low", "high"}, f"raw zone keys {z}"
+        assert z["high"] > z["low"] > 0
+        h = (z["high"] - z["low"]) / ((z["low"] + z["high"]) / 2)
+        assert h <= 0.02, f"zone too tall: {z}"
+    # the supply zone must sit near the 440 swing high, demand near 400
+    sup = [z for z in zs if z["side"] == "SHORT"]
+    dem = [z for z in zs if z["side"] == "LONG"]
+    assert any(z["high"] >= 438 for z in sup), f"supply {sup}"
+    assert any(z["low"] <= 402 for z in dem), f"demand {dem}"
+
+
+def test_auto_poi_fresh_filter_and_expiry():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _auto_poi_cfg(d)
+    now = datetime(2026, 1, 22, 9, 30, tzinfo=IST)
+    # 1) broken supply: price later CLOSES above the 440 swing high
+    ap = AutoPoi(cfg, FakeProv({"TEST": _swing_series(rally_over=True)}),
+                 base_dir=d)
+    h1 = ap.provider.get_intraday(["TEST"], "60m", "60d", now=now)
+    h4 = ap._h4_buckets(h1["TEST"])
+    zs = ap._zones_from_h4(h4)
+    assert all(z["side"] != "SHORT" for z in zs), \
+        f"closed-through supply must be discarded: {zs}"
+    # 2) today's partial session never enters the zone math
+    today_bars = _h1_session("2026-01-22",
+                             [454.0, 456.0, 458.0, 460.0, 462.0, 464.0,
+                              466.0])
+    h4b = ap._h4_buckets(h1["TEST"] + today_bars)
+    assert all(b.ts.date().isoformat() < "2026-01-22"
+               for b in AutoPoi._h4_buckets(h1["TEST"]))   # sanity
+    zs2 = ap._zones_from_h4([b for b in h4b
+                             if b.ts.date().isoformat() < "2026-01-22"])
+    assert zs2 == zs or all(z["side"] != "SHORT" for z in zs2)
+
+
+def test_auto_poi_file_roundtrip_and_idempotence():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _auto_poi_cfg(d)
+    prov = FakeProv({"TEST": _swing_series()})
+    ap = AutoPoi(cfg, prov, base_dir=d)
+    now = datetime(2026, 1, 22, 9, 30, tzinfo=IST)
+    res = ap.ensure_today(["TEST"], now,
+                          bias_of=lambda s, daily: "BULL")
+    assert res is not None and res[0] > 0 and res[1] == 1
+    # bias BULL -> only demand zones survive the pre-filter
+    with open(ap.out_path, "r", encoding="utf-8") as f:
+        rows = [ln.strip() for ln in f if ln.strip()
+                and not ln.startswith("#")
+                and not ln.startswith("symbol")]
+    assert rows and all(r.split(",")[1] == "LONG" for r in rows), rows
+    assert all(r.split(",")[4] == "2026-01-22" for r in rows)
+    # idempotence: a second call the same day must NOT re-fetch
+    calls = prov.h1_calls
+    assert ap.ensure_today(["TEST"], now) is None
+    assert prov.h1_calls == calls, "must skip when today's map exists"
+    # the ChoChEngine picks the auto file up
+    eng = ChoChEngine(cfg, base_dir=d)
+    assert "TEST" in eng.zones and eng.zones["TEST"], eng.zones
+    # date gate: an undated zone trades, the SAME zone dated yesterday
+    # is loaded but must NOT trade today (zones expire at midnight)
+    good = {"side": "LONG", "low": 100.20, "high": 101.00, "date": ""}
+    stale = dict(good, date="2026-01-21")
+    day = now.date().isoformat()
+    m15 = _mk_bars_step(day, [
+        (102.00, 102.10, 101.60, 101.70, 1000),
+        (101.70, 101.80, 101.20, 101.30, 1000),
+        (101.30, 101.40, 100.90, 101.00, 1000),   # tap
+        (101.00, 101.10, 100.95, 101.05, 1000),   # deeper tap
+        (101.05, 101.65, 101.00, 101.60, 1000),   # 10:15 confirm close
+    ], step=15)
+    h1 = _mk_bars_step(day, [
+        (101.30, 101.40, 100.80, 100.90, 5000),   # red bar at the zone
+        (100.90, 101.60, 100.75, 101.55, 5000),   # bullish engulfing
+    ], step=60)
+    assert eng.update("T2", [good], "BULL", m15, h1, now) is not None, \
+        "control: the same zone undated must produce a signal"
+    assert eng.update("T2", [stale], "BULL", m15, h1, now) is None, \
+        "yesterday's zones must not trade today"
+
+
+SELF_TESTS = [test_config_merge, test_journal_autocreate, test_rsi_atr_helpers,
+              test_record_and_dedup, test_long_target_win, test_long_stop_loss,
+              test_short_mirror, test_same_bar_conservative_loss,
+              test_eod_squareoff, test_catch_up_backfill,
+              test_day_verdicts_and_breaker, test_state_rebuild_from_csv,
+              test_entry_cutoff_and_gates, test_quote_fast_check,
+              test_s2_min_stop_gate, test_s1_fib_t01, test_s1_trigger_expiry,
+              test_s3_zone_flow, test_s3_bias_structure,
+              test_entries_allowed_caps,
+              test_auto_poi_h4_and_zones, test_auto_poi_fresh_filter_and_expiry,
+              test_auto_poi_file_roundtrip_and_idempotence]
+
+
+def run_selftests():
+    print(f"SELF-TEST SUITE - scanner v{VERSION}")
+    print("-" * 66)
+    fails = 0
+    for fn in SELF_TESTS:
+        try:
+            fn()
+            print(f"  PASS  {fn.__name__}")
+        except Exception as e:
+            fails += 1
+            print(f"  FAIL  {fn.__name__}: {e}")
+            traceback.print_exc(limit=2)
+    print("-" * 66)
+    print(f"{len(SELF_TESTS) - fails}/{len(SELF_TESTS)} passed")
+    return fails == 0
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+def main():
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    ap = argparse.ArgumentParser(description="Intraday scanner v%s - all 3 "
+                                 "SOP strategies + 15:10 auto square-off"
+                                 % VERSION)
+    ap.add_argument("--once", action="store_true", help="single scan cycle")
+    ap.add_argument("--journal", action="store_true",
+                    help="update journal + print report (no scanning)")
+    ap.add_argument("--selftest", action="store_true", help="run test suite")
+    ap.add_argument("--config", default="config.json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+
+    if args.selftest:
+        ok = run_selftests()
+        sys.exit(0 if ok else 1)
+
+    if args.journal:
+        j = TradeJournal(base_dir=".", cfg=cfg, notify=send_telegram)
+        try:
+            j.catch_up(make_bar_provider(cfg))
+        except Exception as e:
+            print(f"[JOURNAL] catch-up unavailable ({e}) - report only")
+        print(j.report())
+        sys.exit(0)
+
+    try:
+        sc = Scanner(cfg)
+    except ProviderUnavailable as e:
+        print(f"[FATAL] {e}")
+        sys.exit(2)
+
+    if args.once:
+        sc.run_once()
+        now = now_ist()
+        if now.weekday() < 5 and now.time() >= cfg_squareoff(sc.cfg):
+            sc.run_eod()       # cloud / late start: square off + verdict
+        else:
+            print(sc.journal.report())
+    else:
+        sc.run()
+        if sc.cfg.get("auto_exit_after_close", True):
+            sc.run_eod()
+            time.sleep(1)
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
