@@ -1,10 +1,29 @@
 {
   "data_mode": "auto",
   "universe_file": "universe_nifty100.txt",
+  "universe_refresh": {
+    "enabled": true,
+    "days": 7,
+    "min_symbols": 80,
+    "max_symbols": 120
+  },
   "scan_interval_min": 5,
   "scan_start": "09:30",
   "entry_cutoff": "13:30",
   "squareoff": "15:10",
+  "max_trades_per_day": 10,
+  "self_learning": {
+    "enabled": true,
+    "lookback_trades": 30,
+    "recent_trades": 10,
+    "min_trades_to_gate": 8,
+    "block_setup_wr_below": 30.0,
+    "block_setup_r_below": -2.0,
+    "min_recent_trades": 6,
+    "recent_form_wr_below": 20.0,
+    "min_direction_trades": 10,
+    "block_direction_wr_below": 25.0
+  },
   "capital": 25000,
   "risk_pct": 0.25,
   "rr": 3.0,

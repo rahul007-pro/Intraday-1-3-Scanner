@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
- INTRADAY SCANNER v3.1 - ALL THREE SOP STRATEGIES, FULLY AUTOMATED
- (AUTO-POI FOR STRATEGY 3) + 15:10 AUTO SQUARE-OFF + SELF-UPDATING JOURNAL
+ INTRADAY SCANNER v3.2 - ALL THREE SOP STRATEGIES, FULLY AUTOMATED
+ (AUTO-POI FOR STRATEGY 3) + 15:10 AUTO SQUARE-OFF + SELF-LEARNING JOURNAL
 ===============================================================================
 Companion tool to the "Top 3 Intraday Strategies & Scanners SOP (Rev 2.x)".
 
@@ -32,13 +32,60 @@ WHAT IT DOES
        >= 2R else fixed 3R.
 2. Sizes every confirmed signal to the SOP risk model (0.25% capital risk,
    1:3 fixed reward:risk) and enforces SOP 3.4 discipline: max 2 concurrent
-   positions, max 3 entries/day, one position per instrument.
+   positions, max 10 trades/day (config: max_trades_per_day), one position
+   per instrument, and a hard entry cutoff - no signals after 13:30 IST for
+   ANY strategy.
 3. AUTOMATED SQUARE-OFF: the loop stops scanning at 15:10 IST, every OPEN
    trade in the journal is squared off with the freshest available price,
    day verdicts are refreshed, the final report is printed and the console
    closes. A 15:05 heads-up alert is sent first (Telegram/console).
-4. ALERTS ONLY. It never places orders. Verify every signal in your broker
+4. SELF-LEARNING (v3.2): every cycle the scanner studies the last 30 closed
+   trades in the journal - win/loss split by strategy (S1/S2/S3), by
+   direction (LONG/SHORT), by entry hour and the recent 10-trade trend -
+   and BENCHES whatever is statistically losing. A benched strategy or
+   direction emits no signals until its form recovers; gates re-compute
+   after every closed trade and reset from the fresh journal each morning.
+5. ALERTS ONLY. It never places orders. Verify every signal in your broker
    terminal and pass the SOP 12-point checklist before acting.
+
+WHAT IS NEW IN v3.2.1 (vs v3.2)
+-------------------------------
+* UNIVERSE AUTO-REFRESH: NIFTY 100 members change when NSE re-balances the
+  index or a company delists, and the old static universe_nifty100.txt kept
+  throwing data errors for dead symbols. The scanner now refreshes its own
+  universe at startup at most once every universe_refresh.days (default 7):
+    1. official NSE constituents CSV (works from home IPs),
+    2. Wikipedia NIFTY 50 + NIFTY Next 50 tables (works from cloud runners),
+    3. the existing file (always the last-resort fallback).
+  A refreshed list is written back to universe_nifty100.txt + cached in
+  universe_cache.json (committed by the GitHub workflow), added/removed
+  symbols are printed and Telegram-alerted. Any failure is non-fatal.
+
+WHAT IS NEW IN v3.2 (vs v3.1)
+-----------------------------
+* SELF-LEARNING ENGINE: the scanner now reads the last 30 closed trades
+  from trade_journal.csv and computes overall form, per-strategy form,
+  LONG vs SHORT form, entry-hour form and the recent-10 "moving trend".
+  From those it builds transparent, rule-based gates:
+    - a strategy family (S1/S2/S3) is BENCHED for the day when it has 8+
+      closed trades and either win rate < 30% or net R <= -2R (tunable),
+      or when its recent form collapses (< 20% WR over 6+ of the last 10
+      trades);
+    - a direction (LONG/SHORT) is BENCHED when it has 10+ closed trades
+      with win rate < 25%.
+  Benched = no new signals from that family/direction; open trades are
+  still monitored to their normal outcome. Gates refresh after every
+  closed trade, so a benched family can earn its way back the same day.
+  The snapshot is saved to journal/learning_state.json (committed by the
+  GitHub Actions workflow, so learning persists across cloud runs), and a
+  SELF-LEARNING REPORT is appended to the EOD output + sent to Telegram
+  once a day.
+* DAILY TRADE CAP RAISED TO 10 (was 3): after 10 trades in a day the
+  scanner stops issuing signals and sends one Telegram notice; open
+  trades keep being monitored and squared off at 15:10 as usual.
+* ENGINE-WIDE 13:30 CUTOFF: the SOP "no entries after 13:30" rule was
+  only enforced inside Strategy 2 - it now filters ALL strategies, so an
+  S1/S3 confirmation that lands at 13:35 is dropped.
 
 WHAT IS NEW IN v3.1 (vs v3.0)
 -----------------------------
@@ -79,6 +126,7 @@ only watches prices and keeps your logbook.
 """
 
 import os
+import io
 import sys
 import csv
 import json
@@ -91,7 +139,7 @@ import urllib.request
 from collections import namedtuple
 from datetime import datetime, timedelta, time as dtime, timezone
 
-VERSION = "3.1.0"
+VERSION = "3.2.1"
 
 # ---------------------------------------------------------------------------
 # Time zone: Indian Standard Time is UTC+05:30 year-round (no DST), so a fixed
@@ -139,6 +187,13 @@ def round_tick(price, mode="nearest", tick=0.05):
 DEFAULT_CONFIG = {
     "data_mode": "auto",              # auto | nse | yahoo
     "universe_file": "universe_nifty100.txt",
+    # ---- v3.2.1 universe auto-refresh (NIFTY 100 re-balance / delisting) ----
+    "universe_refresh": {
+        "enabled": True,              # weekly auto-update of constituents
+        "days": 7,                    # fetch at most once per N days
+        "min_symbols": 80,            # sanity guard on any fetched list
+        "max_symbols": 120
+    },
     "scan_interval_min": 5,
     "rotate_slice": 25,               # NSE mode: bar-check N extra symbols/cycle
     "scan_start": "09:30",            # no signals before this (IST)
@@ -189,7 +244,21 @@ DEFAULT_CONFIG = {
     "s3_poi_max_per_side": 2,         # nearest N fresh zones per side
     # ---- SOP 3.4 / Phase V discipline caps ----
     "max_concurrent_positions": 2,    # never hold more than 2 positions
-    "max_trades_per_day": 3,          # three-entry cap (Phase V doctrine)
+    "max_trades_per_day": 10,         # v3.2: daily trade cap (was 3)
+    # ---- v3.2 self-learning: study the last N closed trades and bench
+    # ---- whatever is statistically losing (rules documented in README 6)
+    "self_learning": {
+        "enabled": True,
+        "lookback_trades": 30,        # study the last 30 closed trades
+        "recent_trades": 10,          # "moving trend" tail of that window
+        "min_trades_to_gate": 8,      # min sample before a family is benched
+        "block_setup_wr_below": 30.0, # bench family: win rate < 30%...
+        "block_setup_r_below": -2.0,  # ...or net R <= -2R
+        "min_recent_trades": 6,       # recent-form collapse: min sample
+        "recent_form_wr_below": 20.0, # ...win rate < 20% of the last 10
+        "min_direction_trades": 10,   # min sample for a direction gate
+        "block_direction_wr_below": 25.0
+    },
     "telegram": {"bot_token": "", "chat_id": ""},
     "journal": {
         "folder": "journal",
@@ -277,6 +346,212 @@ def load_universe(path):
             if s not in syms:
                 syms.append(s)
     return syms
+
+
+# ---------------------------------------------------------------------------
+# v3.2.1 Universe auto-refresh. NIFTY 100 members change whenever NSE
+# re-balances the index (semi-annual review + ad-hoc deletions when a
+# company delists or is suspended). A stale universe then keeps throwing
+# data errors for dead symbols. The scanner therefore refreshes its own
+# universe file at startup, at most once per universe_refresh.days (7):
+#   1. official NSE constituents CSV (nsearchives / archives hosts) -
+#      authoritative, but NSE blocks datacenter IPs so this works from
+#      home broadband, not from GitHub Actions;
+#   2. Wikipedia NIFTY 50 + NIFTY Next 50 constituents tables - reachable
+#      from cloud runners, no API key, updated by editors on re-balance day;
+#   3. the existing universe_nifty100.txt - always kept as last resort.
+# A success rewrites universe_nifty100.txt and caches the result (date,
+# source, symbols) in universe_cache.json; the cloud workflow commits both
+# so every later run starts current. Every failure is non-fatal: the old
+# file stays in use and the next attempt happens after the next window.
+# ---------------------------------------------------------------------------
+_UNIV_TIMEOUT = 15
+_UNIV_HDRS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept": "text/html,application/json,text/csv,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_NSE_LIST_URLS = (
+    "https://nsearchives.nseindia.com/content/indices/"
+    "ind_nifty100list.csv",
+    "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+)
+_WIKI_PAGES = ("https://en.wikipedia.org/wiki/NIFTY_50",
+               "https://en.wikipedia.org/wiki/NIFTY_Next_50")
+
+
+def _fetch_nifty100_nse(timeout=_UNIV_TIMEOUT):
+    """Official NSE constituents CSV -> plain NSE symbols. Raises when
+    unreachable (the caller falls through to the Wikipedia source)."""
+    last = None
+    for url in _NSE_LIST_URLS:
+        try:
+            req = urllib.request.Request(url, headers=_UNIV_HDRS)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text = r.read().decode("utf-8", "replace")
+            syms = []
+            for row in csv.DictReader(io.StringIO(text)):
+                s = (row.get("Symbol") or row.get("SYMBOL") or
+                     "").strip().upper()
+                if s and s not in syms and not s.startswith("NIFTY"):
+                    syms.append(s)
+            if syms:
+                return syms
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"NSE constituent list unreachable ({last})")
+
+
+def _parse_wiki_constituents(page):
+    """Ticker symbols from a Wikipedia constituents wikitable, pure regex
+    (no bs4/lxml dependency): locate the table whose header row has a
+    'Symbol' column, then read that column cell by cell. Returns [] when
+    nothing matches."""
+    import re as _re
+    import html as _html
+    out = []
+    for tbl in _re.findall(r"<table[^>]*wikitable[^>]*>(.*?)</table>",
+                           page, _re.S | _re.I):
+        heads = [_re.sub(r"<[^>]+>", "", h).strip().upper()
+                 for h in _re.findall(r"<th[^>]*>(.*?)</th>",
+                                      tbl, _re.S | _re.I)]
+        if "SYMBOL" not in heads:
+            continue
+        col = heads.index("SYMBOL")
+        for row in _re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, _re.S | _re.I):
+            cells = _re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>",
+                                row, _re.S | _re.I)
+            if not cells or len(cells) <= col:
+                continue
+            n_th = len(_re.findall(r"<th[^>]*>", row, _re.I))
+            if n_th and n_th == len(cells):
+                continue                  # pure header row (thead)
+            sym = _html.unescape(_re.sub(r"<[^>]+>", "", cells[col]))
+            sym = sym.strip().upper()
+            if _re.fullmatch(r"[A-Z0-9&\-\.]{2,20}", sym) and \
+                    not sym.startswith("NIFTY") and sym not in out:
+                out.append(sym)
+    return out
+
+
+def _fetch_nifty100_wiki(timeout=_UNIV_TIMEOUT):
+    """Wikipedia NIFTY 50 + NIFTY Next 50 tables -> ~100 symbols
+    (the NIFTY 100 index is exactly those two buckets). Raises when the
+    combined result is implausibly small."""
+    out = []
+    for url in _WIKI_PAGES:
+        try:
+            req = urllib.request.Request(url, headers=_UNIV_HDRS)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                page = r.read().decode("utf-8", "replace")
+            for s in _parse_wiki_constituents(page):
+                if s not in out:
+                    out.append(s)
+        except Exception as e:
+            print(f"[UNIVERSE] {url.rsplit('/', 1)[-1]}: fetch failed "
+                  f"({e})")
+    if len(out) < 50:
+        raise RuntimeError(f"Wikipedia gave only {len(out)} symbols")
+    return out
+
+
+def _write_universe_file(path, symbols, source, updated):
+    """Rewrite the universe file in load_universe() format (SYMBOL.NS per
+    line). Atomic via temp-file + os.replace."""
+    tmp = path + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(f"# NIFTY 100 constituents - auto-updated {updated} "
+                f"(source: {source})\n")
+        f.write("# Maintained by the scanner universe auto-refresh "
+                "(config: universe_refresh).\n")
+        f.write("# Manual edits are overwritten at the next refresh; "
+                "set universe_refresh.enabled=false to freeze.\n")
+        for s in symbols:
+            f.write(s + ".NS\n")
+    os.replace(tmp, path)
+
+
+def refresh_universe(cfg, base_dir=".", notify=None):
+    """Weekly auto-update of universe_nifty100.txt (see block comment).
+    Returns (symbols, changed): symbols=[] means 'keep the current file'
+    (refresh disabled, inside the schedule window, or every source
+    failed). Never raises."""
+    ru = cfg.get("universe_refresh") or {}
+    if not ru.get("enabled", True):
+        return [], False
+    ufile = os.path.join(base_dir, cfg.get("universe_file",
+                                           "universe_nifty100.txt"))
+    cpath = os.path.join(base_dir, "universe_cache.json")
+    lo, hi = int(ru.get("min_symbols", 80)), int(ru.get("max_symbols", 120))
+    days = float(ru.get("days", 7))
+    today = now_ist().date()
+    cache = {}
+    try:
+        with open(cpath, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    last_att = str(cache.get("last_attempt", ""))
+    if last_att:
+        try:
+            gap = (today - datetime.strptime(last_att, "%Y-%m-%d").date()).days
+            if gap < days:
+                return [], False          # inside the schedule window
+        except ValueError:
+            pass                          # corrupt date -> try again
+    old = load_universe(ufile)
+    print(f"[UNIVERSE] refreshing NIFTY 100 constituents (file has "
+          f"{len(old)} symbols; last attempt {last_att or 'never'})...")
+    syms, source = [], None
+    for name, fn in (("NSE", _fetch_nifty100_nse),
+                     ("Wikipedia", _fetch_nifty100_wiki)):
+        try:
+            got = fn()
+            if lo <= len(got) <= hi:
+                syms, source = got, name
+                break
+            print(f"[UNIVERSE] {name} list rejected: {len(got)} symbols "
+                  f"outside the {lo}-{hi} sanity window")
+        except Exception as e:
+            print(f"[UNIVERSE] {name} unavailable: {e}")
+    snap = {"last_attempt": today.isoformat(),
+            "updated": cache.get("updated", ""),
+            "source": cache.get("source", "")}
+    changed = False
+    if source:
+        added = [s for s in syms if s not in old]
+        removed = [s for s in old if s not in syms]
+        try:
+            _write_universe_file(ufile, syms, source, today.isoformat())
+            changed = True
+            snap["updated"] = today.isoformat()
+            snap["source"] = source
+            snap["symbols"] = syms
+            print(f"[UNIVERSE] refreshed from {source}: {len(syms)} symbols "
+                  f"(+{len(added)} added, -{len(removed)} removed)")
+            if (added or removed) and notify:
+                msg = (f"\U0001f4bb Universe auto-refresh from {source}: "
+                       f"{len(syms)} symbols (+{len(added)} added, "
+                       f"-{len(removed)} removed)")
+                if added:
+                    msg += "\n+ " + ", ".join(added[:15])
+                if removed:
+                    msg += "\n- " + ", ".join(removed[:15])
+                notify(msg)
+        except Exception as e:
+            print(f"[UNIVERSE] could not rewrite the universe file ({e}); "
+                  f"keeping the old list")
+    else:
+        print("[UNIVERSE] all sources failed - keeping the current file "
+              f"(next attempt in {int(days)} day(s))")
+    try:
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=1)
+    except Exception:
+        pass
+    return syms, changed
 
 
 def ema_series(values, period):
@@ -1874,12 +2149,314 @@ def cfg_squareoff(cfg):
 
 
 # ===========================================================================
+# SELF-LEARNING ENGINE (v3.2)
+# Studies the last N closed trades in the journal and adapts the scanner:
+# benched strategies/directions stop emitting signals; healthy ones keep
+# firing. Rule-based and fully transparent - every gate carries its reason.
+# ===========================================================================
+def _fam_of(setup):
+    """Setup tag -> strategy family: S1_FIB_T01 -> S1, S2_BREAKOUT -> S2,
+    S3_CHOCH -> S3."""
+    return (setup or "").split("_")[0].upper() or "?"
+
+
+def _in_signal_window(sig, cfg):
+    """SOP entry window for EVERY strategy: scan_start <= signal time <=
+    entry_cutoff (09:30-13:30 by default). Strategy 2 checks this itself;
+    this central filter also covers S1/S3 confirmations."""
+    try:
+        t = parse_hhmm(sig.sig_time)
+    except Exception:
+        return True
+    return cfg["scan_start_t"] <= t <= cfg["entry_cutoff_t"]
+
+
+class SelfLearner:
+    """Learns from the trade journal and adapts the scanner every day.
+
+    Every refresh() it reads the last `lookback_trades` (default 30) CLOSED
+    trades from trade_journal.csv and computes:
+      * overall form       - wins / losses / win rate / net R / avg R
+      * per-setup form     - S1 / S2 / S3 families (Setup column prefix)
+      * per-direction form - LONG vs SHORT
+      * per-hour form      - entry hour buckets (09..13)
+      * recent form        - the last 10 closed trades ("moving trend")
+    From those it builds today's GATES (transparent, rule-based):
+      * a setup family is BENCHED when it has >= min_trades_to_gate closed
+        trades and (win rate < block_setup_wr_below OR net R <=
+        block_setup_r_below), or when its recent form collapses (>=
+        min_recent_trades of the last recent_trades with win rate <
+        recent_form_wr_below);
+      * a direction is BENCHED when it has >= min_direction_trades closed
+        trades with win rate < block_direction_wr_below.
+    Benched = that family/direction emits no new signals; open trades are
+    still monitored to their normal outcome. Gates re-compute after every
+    closed trade, so a benched family can earn its way back the same day,
+    and everything resets next morning from the fresh journal.
+
+    The snapshot is saved to journal/learning_state.json - inside the
+    journal folder, so the GitHub Actions workflow commits it and learning
+    persists across cloud runs. `report_text()` renders the EOD digest and
+    `digest()` Telegrams it once per day.
+    """
+
+    def __init__(self, journal, cfg, notify=None):
+        self.journal = journal
+        self.cfg = cfg
+        self.notify = notify if notify is not None else (lambda m: None)
+        sl = cfg.get("self_learning") or {}
+        self.enabled = bool(sl.get("enabled", True))
+        self.lookback = int(sl.get("lookback_trades", 30) or 30)
+        self.recent_n = int(sl.get("recent_trades", 10) or 10)
+        self.min_setup_n = int(sl.get("min_trades_to_gate", 8) or 8)
+        self.block_setup_wr = float(sl.get("block_setup_wr_below", 30.0))
+        self.block_setup_r = float(sl.get("block_setup_r_below", -2.0))
+        self.min_recent_n = int(sl.get("min_recent_trades", 6) or 6)
+        self.recent_block_wr = float(sl.get("recent_form_wr_below", 20.0))
+        self.min_dir_n = int(sl.get("min_direction_trades", 10) or 10)
+        self.block_dir_wr = float(sl.get("block_direction_wr_below", 25.0))
+        self.path = os.path.join(journal.dir, "learning_state.json")
+        self.stats = {}
+        self.gates = {"blocked_setups": {}, "blocked_directions": {},
+                      "preferred": ""}
+        self.prev = {}
+        self._load()
+
+    # ---------------- state file -------------------------------------------
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.prev = json.load(f)
+            except Exception as e:
+                print(f"[LEARN] state file unreadable ({e}); rebuilding")
+                self.prev = {}
+
+    def _save(self, snap):
+        if snap == self.prev:            # write only on real change
+            return
+        self.prev = snap
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=1)
+            os.replace(tmp, self.path)   # atomic write
+        except Exception as e:
+            print(f"[LEARN] could not save state ({e})")
+
+    # ---------------- analysis ----------------------------------------------
+    @staticmethod
+    def _bucket(rows):
+        n = len(rows)
+        wins = sum(1 for r in rows if r.get("Result") == "WIN")
+        losses = sum(1 for r in rows if r.get("Result") == "LOSS")
+        r_sum = sum(float(r.get("PnL_R") or 0) for r in rows)
+        return {"n": n, "wins": wins, "losses": losses,
+                "wr": round(100.0 * wins / n, 1) if n else 0.0,
+                "r": round(r_sum, 2),
+                "avg_r": round(r_sum / n, 3) if n else 0.0}
+
+    def refresh(self, now=None):
+        """Re-read the journal, rebuild stats + gates. One CSV read - cheap
+        enough to run every scan cycle, so gates adapt intraday too."""
+        now = now or now_ist()
+        self.stats = {}
+        self.gates = {"blocked_setups": {}, "blocked_directions": {},
+                      "preferred": ""}
+        if not self.enabled:
+            return self.stats
+        closed = [r for r in self.journal._read_trades()
+                  if r.get("Status") != "OPEN" and r.get("Result")]
+        closed.sort(key=lambda r: (r.get("Date", ""), r.get("ExitTime", "")))
+        studied = closed[-self.lookback:]
+        if not studied:
+            self._save(self._snapshot(now))
+            return self.stats
+        self.stats["overall"] = self._bucket(studied)
+        self.stats["recent"] = self._bucket(studied[-self.recent_n:])
+        streak = 0                       # current losing streak
+        for r in reversed(studied):
+            if r.get("Result") == "LOSS":
+                streak += 1
+            else:
+                break
+        self.stats["loss_streak"] = streak
+        for key, grouper in (
+                ("setups", lambda r: _fam_of(r.get("Setup"))),
+                ("directions", lambda r: r.get("Direction", "?")),
+                ("hours", lambda r: (r.get("SignalTime") or "?")[:2])):
+            buckets = {}
+            for r in studied:
+                buckets.setdefault(grouper(r), []).append(r)
+            self.stats[key] = {k: self._bucket(v)
+                               for k, v in sorted(buckets.items())}
+        # per-family RECENT form: how each family did inside the last
+        # recent_n closed trades (the moving trend used by gate rule 2)
+        fam_recent = {}
+        for r in studied[-self.recent_n:]:
+            fam_recent.setdefault(_fam_of(r.get("Setup")), []).append(r)
+        self.stats["setup_recent"] = {k: self._bucket(v)
+                                      for k, v in sorted(fam_recent.items())}
+        self._build_gates()
+        self._save(self._snapshot(now))
+        return self.stats
+
+    def _build_gates(self):
+        s = self.stats
+        # 1) benched strategy families - slow form over the studied window
+        for fam, b in s.get("setups", {}).items():
+            if fam not in ("S1", "S2", "S3") or b["n"] < self.min_setup_n:
+                continue
+            if (b["wr"] < self.block_setup_wr
+                    or b["r"] <= self.block_setup_r):
+                self.gates["blocked_setups"][fam] = (
+                    f"{b['wr']:.0f}% WR / {b['r']:+.1f}R over last "
+                    f"{b['n']} trades (rule: bench below "
+                    f"{self.block_setup_wr:g}% WR or {self.block_setup_r:g}R "
+                    f"on {self.min_setup_n}+ trades)")
+        # 2) recent-form collapse (the moving trend): a family whose last
+        #    few trades crumbled is benched even if the 30-trade view still
+        #    looks acceptable
+        for fam, b in s.get("setup_recent", {}).items():
+            if (fam in self.gates["blocked_setups"]
+                    or fam not in ("S1", "S2", "S3")):
+                continue
+            if b["n"] >= self.min_recent_n and b["wr"] < self.recent_block_wr:
+                self.gates["blocked_setups"][fam] = (
+                    f"recent form {b['wr']:.0f}% WR over last {b['n']} "
+                    f"trades (rule: bench below {self.recent_block_wr:g}% "
+                    f"on {self.min_recent_n}+)")
+        # 3) benched directions
+        for d, b in s.get("directions", {}).items():
+            if d in ("LONG", "SHORT") and b["n"] >= self.min_dir_n \
+                    and b["wr"] < self.block_dir_wr:
+                self.gates["blocked_directions"][d] = (
+                    f"{b['wr']:.0f}% WR over last {b['n']} trades (rule: "
+                    f"bench below {self.block_dir_wr:g}% on "
+                    f"{self.min_dir_n}+)")
+        # 4) advisory: top performer among the healthy families
+        cand = [(b["r"], fam) for fam, b in s.get("setups", {}).items()
+                if fam in ("S1", "S2", "S3") and b["n"] >= 3
+                and fam not in self.gates["blocked_setups"]]
+        if cand:
+            self.gates["preferred"] = max(cand)[1]
+
+    def _snapshot(self, now):
+        return {"as_of": now.date().isoformat(),
+                "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "config": {"lookback_trades": self.lookback,
+                           "recent_trades": self.recent_n},
+                "stats": self.stats,
+                "gates": self.gates,
+                "digest_sent": (self.prev.get("digest_sent", {})
+                                if isinstance(self.prev, dict) else {})}
+
+    # ---------------- gating -------------------------------------------------
+    def allow(self, sig):
+        """(ok, reason): is this signal allowed under the learned gates?"""
+        if not self.enabled:
+            return True, ""
+        fam = _fam_of(sig.setup)
+        why = self.gates["blocked_setups"].get(fam)
+        if why:
+            return False, f"{fam} benched by self-learner: {why}"
+        why = self.gates["blocked_directions"].get(sig.direction)
+        if why:
+            return False, f"{sig.direction} benched by self-learner: {why}"
+        return True, ""
+
+    # ---------------- reporting ----------------------------------------------
+    def status_line(self):
+        if not self.enabled:
+            return "[LEARN] self-learning disabled (config: self_learning)"
+        o = self.stats.get("overall")
+        if not o:
+            return ("[LEARN] no closed trades to learn from yet - "
+                    "all gates open")
+        benched = ", ".join(sorted(self.gates["blocked_setups"])) or "none"
+        dirs = ", ".join(sorted(self.gates["blocked_directions"])) or "none"
+        pref = self.gates.get("preferred") or "-"
+        return (f"[LEARN] last {o['n']} closed: {o['wins']}W/{o['losses']}L "
+                f"({o['wr']:.0f}% WR, {o['r']:+.1f}R) | benched: {benched} | "
+                f"benched directions: {dirs} | top performer: {pref}")
+
+    def report_text(self):
+        if not self.enabled:
+            return ""
+        o = self.stats.get("overall")
+        if not o:
+            return ""    # nothing learned yet - no report, no digest noise
+        L = [f"SELF-LEARNING REPORT (studied last {o['n']} closed trades)",
+             f"  overall : {o['wins']}W/{o['losses']}L | win rate "
+             f"{o['wr']:.0f}% | net {o['r']:+.2f}R | avg "
+             f"{o['avg_r']:+.2f}R/trade"]
+        rec = self.stats.get("recent")
+        if rec and rec["n"]:
+            L.append(f"  recent {rec['n']:>2}: {rec['wins']}W/"
+                     f"{rec['losses']}L | {rec['wr']:.0f}% WR | "
+                     f"{rec['r']:+.2f}R   <- moving trend")
+        L.append(f"  losing streak: {self.stats.get('loss_streak', 0)}")
+        for fam, b in self.stats.get("setups", {}).items():
+            if fam not in ("S1", "S2", "S3"):
+                continue
+            tag = "  [BENCHED - no signals]" \
+                if fam in self.gates["blocked_setups"] else ""
+            star = "  <- top performer" \
+                if fam == self.gates.get("preferred") else ""
+            L.append(f"  {fam}: {b['wins']}W/{b['losses']}L | "
+                     f"{b['wr']:.0f}% WR | {b['r']:+.2f}R over "
+                     f"{b['n']}{tag}{star}")
+        for d, b in self.stats.get("directions", {}).items():
+            if d not in ("LONG", "SHORT"):
+                continue
+            tag = "  [BENCHED - no signals]" \
+                if d in self.gates["blocked_directions"] else ""
+            L.append(f"  {d}: {b['wins']}W/{b['losses']}L | "
+                     f"{b['wr']:.0f}% WR | {b['r']:+.2f}R over "
+                     f"{b['n']}{tag}")
+        hrs = self.stats.get("hours", {})
+        parts = [f"{h}:xx {b['wr']:.0f}%({b['n']})"
+                 for h, b in hrs.items() if b["n"]]
+        if parts:
+            L.append("  by entry hour: " + " | ".join(parts))
+        for fam, why in self.gates["blocked_setups"].items():
+            L.append(f"  gate: {fam} benched - {why}")
+        for d, why in self.gates["blocked_directions"].items():
+            L.append(f"  gate: {d} benched - {why}")
+        return "\n".join(L)
+
+    def digest(self, now=None):
+        """Telegram the learning digest once per day (EOD). Returns text."""
+        now = now or now_ist()
+        txt = self.report_text()
+        if not txt:
+            return ""
+        today = now.date().isoformat()
+        sent = (self.prev.get("digest_sent", {})
+                if isinstance(self.prev, dict) else {})
+        if not sent.get(today):
+            self.notify("\U0001f9e0 " + txt)
+            sent[today] = True
+            snap = self._snapshot(now)
+            snap["digest_sent"] = sent
+            self._save(snap)
+        return txt
+
+
+# ===========================================================================
 # SCANNER LOOP
 # ===========================================================================
 class Scanner:
     def __init__(self, cfg, base_dir="."):
         self.cfg = cfg
         self.base_dir = base_dir
+        # v3.2.1: weekly NIFTY 100 constituent refresh BEFORE the file is
+        # read - removes delisted/replaced symbols without manual edits.
+        # Never raises: on any failure the shipped file stays in use.
+        try:
+            refresh_universe(cfg, base_dir=base_dir, notify=send_telegram)
+        except Exception as e:
+            print(f"[UNIVERSE] refresh skipped ({e})")
         self.universe = load_universe(os.path.join(base_dir, cfg["universe_file"]))
         if not self.universe:
             raise SystemExit("Universe is empty - check universe_nifty100.txt")
@@ -1900,6 +2477,13 @@ class Scanner:
         self.bars = make_bar_provider(cfg)   # raises if yfinance missing
         self.journal = TradeJournal(base_dir=base_dir, cfg=cfg,
                                     notify=send_telegram)
+        # v3.2 self-learning: load the journal's history and build today's
+        # gates (benched strategies/directions) before any scanning starts
+        self.learner = SelfLearner(self.journal, cfg, notify=send_telegram)
+        try:
+            self.learner.refresh()
+        except Exception as e:
+            print(f"[LEARN] initial refresh failed ({e}); gates open")
         # strategy engines
         self.fib = FibEngine(cfg)                       # Strategy 1
         self.s3 = (ChoChEngine(cfg, base_dir=base_dir)   # Strategy 3
@@ -1915,16 +2499,35 @@ class Scanner:
         return {o["symbol"] for o in self.journal.state["open"]}
 
     def _entries_allowed(self, now):
-        """SOP 3.4 / Phase V discipline: 3-entry cap, 2 concurrent positions."""
+        """SOP 3.4 / Phase V discipline: daily trade cap (10), 2 concurrent
+        positions."""
         today = now.date().isoformat()
         day_n = sum(1 for r in self.journal._read_trades()
                     if r.get("Date") == today)
         open_n = len(self.journal.state["open"])
-        if day_n >= int(self.cfg.get("max_trades_per_day", 3)):
+        if day_n >= int(self.cfg.get("max_trades_per_day", 10)):
             return False, f"daily entry cap reached ({day_n} trades today)"
         if open_n >= int(self.cfg.get("max_concurrent_positions", 2)):
             return False, f"max concurrent positions held ({open_n})"
         return True, ""
+
+    def _cap_notice(self, now):
+        """v3.2: one-time Telegram/console notice when the daily trade cap
+        is hit. Open trades keep being monitored to their outcome."""
+        today = now.date().isoformat()
+        cap = int(self.cfg.get("max_trades_per_day", 10))
+        day_n = sum(1 for r in self.journal._read_trades()
+                    if r.get("Date") == today)
+        if day_n < cap or self.journal.state.get("cap_notified", {}).get(today):
+            return
+        self.journal.state.setdefault("cap_notified", {})[today] = True
+        self.journal._save_state()
+        msg = (f"\U0001f6d1 DAILY CAP {today}: {day_n}/{cap} trades taken - "
+               f"no more signals today. Open trades keep being monitored "
+               f"and square off at {self.cfg.get('squareoff', '15:10')} IST "
+               f"as usual.")
+        print("\n" + msg + "\n")
+        send_telegram(msg)
 
     def run_once(self, now=None):
         now = now or now_ist()
@@ -1963,7 +2566,9 @@ class Scanner:
                 if sym in self._open_symbols():
                     self.journal.on_quote(sym, q, now=now)
 
-        # 2) fresh signals (suppressed after the daily circuit breaker)
+        # 2) fresh signals (suppressed after the daily circuit breaker;
+        #    gates re-learned from the journal every cycle - v3.2)
+        self.learner.refresh(now=now)
         fresh = []
         if self.journal.breaker_tripped_today(now=now):
             print("[SOP] CIRCUIT BREAKER active for today - "
@@ -1984,12 +2589,28 @@ class Scanner:
                         fresh.append(sig)
             else:
                 print(f"[SOP] {why} - no new entries")
+
+        # v3.2 engine-wide entry window: no signals before scan_start or
+        # after entry_cutoff (13:30) for ANY strategy (S2 self-gates; this
+        # also drops S1/S3 confirmations that land after the cutoff)
+        n_all = len(fresh)
+        fresh = [s for s in fresh if _in_signal_window(s, self.cfg)]
+        if len(fresh) != n_all:
+            print(f"[SOP] dropped {n_all - len(fresh)} signal(s) outside the "
+                  f"{self.cfg['scan_start']}-{self.cfg['entry_cutoff']} "
+                  f"entry window")
+        self._cap_notice(now)
+
         for sig in fresh:
             if sig.symbol in self._open_symbols():
                 continue        # SOP 3.4: one position per instrument
             ok, _ = self._entries_allowed(now)
             if not ok:
                 break
+            ok, why = self.learner.allow(sig)   # v3.2 self-learning gates
+            if not ok:
+                print(f"[LEARN] signal suppressed - {why}")
+                continue
             tid = self.journal.record_signal(sig)
             if tid:
                 self._alert(sig)
@@ -2089,6 +2710,15 @@ class Scanner:
               f"{'ON' if self.s3 else 'off'} ({n_zones} POI zones, "
               f"auto-POI={'ON' if self.auto_poi is not None else 'off'})")
         print("[SCANNER] alerts only - it never places orders.")
+        print(f"[SCANNER] discipline: max "
+              f"{self.cfg.get('max_trades_per_day', 10)} trades/day | max "
+              f"{self.cfg.get('max_concurrent_positions', 2)} concurrent | "
+              f"entries {self.cfg['scan_start']}-"
+              f"{self.cfg['entry_cutoff']} IST")
+        try:
+            print(self.learner.status_line())
+        except Exception:
+            pass
         # back-fill anything the last session missed
         try:
             self.journal.catch_up(self.bars)
@@ -2159,6 +2789,15 @@ class Scanner:
             print(f"[JOURNAL] force square-off failed: {e}")
         # 3) final report
         print("\n" + self.journal.report(now=now))
+        # 4) v3.2 self-learning digest: re-learn after today's settlements,
+        #    print the report and Telegram it (once per day)
+        try:
+            self.learner.refresh(now=now)
+            lr = self.learner.digest(now=now)
+            if lr:
+                print("\n" + lr)
+        except Exception as e:
+            print(f"[LEARN] digest failed ({e})")
         print("\n[SOP] EOD square-off + journal update complete.")
 
     def _force_squareoff(self, now=None):
@@ -2238,7 +2877,8 @@ BASE_BARS = _trend_spec(45) + [SPIKE]
 
 
 def _test_cfg(tmp, **over):
-    cfg = deep_merge(DEFAULT_CONFIG, {"journal": {"folder": "journal"}})
+    cfg = deep_merge(DEFAULT_CONFIG, {"journal": {"folder": "journal"},
+                                      "universe_refresh": {"enabled": False}})
     cfg["scan_start_t"] = parse_hhmm(cfg["scan_start"])
     cfg["entry_cutoff_t"] = parse_hhmm(cfg["entry_cutoff"])
     cfg["squareoff_t"] = parse_hhmm(cfg["squareoff"])
@@ -2687,6 +3327,108 @@ def test_entries_allowed_caps():
     assert ok
 
 
+# ------------------------- SelfLearner tests (v3.2) -----------------------
+def _closed_row(tid, date, sig_time, setup, direction, result, pnl_r,
+                exit_time="15:10"):
+    """A CLOSED trade row shaped exactly like the journal writes them."""
+    return {"TradeID": tid, "Date": date, "SignalTime": sig_time,
+            "Symbol": "TST", "Direction": direction, "Setup": setup,
+            "Entry": "100.00", "StopLoss": "99.00", "Target": "103.00",
+            "Qty": 10, "RiskPerShare": "1.00", "RiskAmt": "10.00",
+            "RewardAmt": "30.00", "RR": "1:3", "Status": "CLOSED",
+            "ExitPrice": "100.50", "ExitTime": exit_time,
+            "ExitReason": "EOD_SQUAREOFF", "Result": result,
+            "PnL_R": f"{pnl_r:.3f}", "PnL_Amt": "0", "UpdatedAt": "",
+            "Notes": ""}
+
+
+def _lr_sig(setup, direction="LONG", hhmm="10:05"):
+    return Signal("TST", direction, "2026-01-07", hhmm, 100.0,
+                  99.0 if direction == "LONG" else 101.0,
+                  103.0 if direction == "LONG" else 97.0,
+                  10, 1.0, 10.0, 30.0, note="", setup=setup)
+
+
+def test_learner_gates():
+    import tempfile
+    d = tempfile.mkdtemp()
+    cfg = _test_cfg(d)
+    j = TradeJournal(base_dir=d, cfg=cfg, notify=None)
+    rows = []
+    # 10 losing S3 SHORT trades -> rule 1 (family) + direction gate
+    for i in range(10):
+        rows.append(_closed_row(f"T3-{i}", "2026-01-05", "09:45", "S3_CHOCH",
+                                "SHORT", "LOSS", -1.0,
+                                exit_time=f"10:{i:02d}"))
+    # S1: 40% WR / +6R over 10 trades -> rule 1 passes...
+    for i in range(4):
+        rows.append(_closed_row(f"T1W-{i}", "2026-01-06", "10:00",
+                                "S1_FIB_T01", "LONG", "WIN", 3.0,
+                                exit_time=f"10:{i * 10:02d}"))
+    # ...but its 6 most recent trades all lost -> rule 2 (recent collapse)
+    for i in range(6):
+        rows.append(_closed_row(f"T1L-{i}", "2026-01-06", "11:00",
+                                "S1_FIB_T01", "LONG", "LOSS", -1.0,
+                                exit_time=f"14:{i * 10:02d}"))
+    # S2: 3 healthy wins -> stays open, becomes top performer
+    for i in range(3):
+        rows.append(_closed_row(f"T2W-{i}", "2026-01-06", "12:00",
+                                "S2_BREAKOUT", "LONG", "WIN", 3.0,
+                                exit_time=f"12:{i * 10:02d}"))
+    j._write_csv(j.trades_csv, TRADE_COLS, rows)
+
+    lr = SelfLearner(j, cfg, notify=None)
+    lr.refresh(now=datetime(2026, 1, 7, 9, 0, tzinfo=IST))
+    assert lr.stats["overall"]["n"] == 23
+    assert lr.gates["blocked_setups"].get("S3"), "S3 (0% WR over 10) benched"
+    assert "recent form" in lr.gates["blocked_setups"].get("S1", ""), \
+        "S1 benched by recent-form collapse, not by the 30-trade view"
+    assert lr.gates["blocked_directions"].get("SHORT"), \
+        "SHORT (0% WR over 10) benched"
+    assert lr.gates["preferred"] == "S2"
+    # gating behaviour
+    ok, _ = lr.allow(_lr_sig("S2_BREAKOUT", "LONG"))
+    assert ok, "healthy family + open direction must pass"
+    ok, why = lr.allow(_lr_sig("S3_CHOCH", "SHORT"))
+    assert not ok and "S3" in why
+    ok, why = lr.allow(_lr_sig("S2_BREAKDOWN", "SHORT"))
+    assert not ok and "SHORT" in why, \
+        "direction gate fires even for a healthy family"
+    # snapshot persisted inside the journal folder
+    assert os.path.exists(lr.path)
+    with open(lr.path, "r", encoding="utf-8") as f:
+        snap = json.load(f)
+    assert snap["gates"]["blocked_setups"].get("S1")
+    # digest sends once per day only
+    sent = []
+    lr2 = SelfLearner(j, cfg, notify=sent.append)
+    lr2.prev = lr.prev
+    lr2.refresh(now=datetime(2026, 1, 7, 15, 15, tzinfo=IST))
+    lr2.digest(now=datetime(2026, 1, 7, 15, 15, tzinfo=IST))
+    assert len(sent) == 1
+    lr2.digest(now=datetime(2026, 1, 7, 15, 20, tzinfo=IST))
+    assert len(sent) == 1, "digest is once-per-day"
+    # disabled learner never blocks
+    cfg_off = _test_cfg(d, self_learning={"enabled": False})
+    lr3 = SelfLearner(j, cfg_off, notify=None)
+    ok, _ = lr3.allow(_lr_sig("S3_CHOCH", "SHORT"))
+    assert ok
+
+
+def test_signal_window_filter():
+    cfg = _test_cfg(".")
+
+    def mk(hhmm):
+        return _lr_sig("S2_BREAKOUT", "LONG", hhmm)
+
+    assert _in_signal_window(mk("09:30"), cfg)      # window opens
+    assert _in_signal_window(mk("11:05"), cfg)
+    assert _in_signal_window(mk("13:30"), cfg)      # cutoff inclusive
+    assert not _in_signal_window(mk("13:35"), cfg), "no signals after 13:30"
+    assert not _in_signal_window(mk("09:00"), cfg), "no signals before 09:30"
+    assert DEFAULT_CONFIG["max_trades_per_day"] == 10, "v3.2 daily cap"
+
+
 # ------------------------- AutoPoi tests ----------------------------------
 def _h1_session(day, closes, wick=0.12, vol=5000):
     """Six 1h bars (09:15..15:15 IST) walking through `closes`."""
@@ -2855,6 +3597,86 @@ def test_auto_poi_file_roundtrip_and_idempotence():
         "yesterday's zones must not trade today"
 
 
+_WIKI_FIXTURE = """<html><body>
+<table class="wikitable sortable jquery-tablesorter">
+<thead><tr><th>Symbol</th><th>Company Name</th><th>Sector</th></tr></thead>
+<tbody>
+<tr><td><a href="/wiki/Reliance_Industries" title="Reliance">RELIANCE</a></td>
+<td>Reliance Industries</td><td>Energy</td></tr>
+<tr><td><a href="/wiki/HDFC_Bank">HDFCBANK</a></td><td>HDFC Bank</td>
+<td>Financial Services</td></tr>
+<tr><td><a href="/wiki/M%26M">M&amp;M</a></td><td>Mahindra &amp; Mahindra</td>
+<td>Automotive</td></tr>
+<tr><td>NIFTY 50</td><td>Index itself</td><td>Index</td></tr>
+</tbody></table>
+<table class="wikitable"><tr><th>Name</th><th>Value</th></tr>
+<tr><td>not a constituents table</td><td>1</td></tr></table>
+</body></html>"""
+
+
+def test_universe_refresh_flow():
+    import tempfile
+    d = tempfile.mkdtemp()
+    ufile = os.path.join(d, "universe_nifty100.txt")
+    with open(ufile, "w") as f:
+        f.write("# stale shipped file\nDELISTED.NS\nRELIANCE.NS\n")
+    cfg = deep_merge(DEFAULT_CONFIG, {"journal": {"folder": "journal"},
+                                      "universe_refresh": {
+        "enabled": True, "days": 7, "min_symbols": 2, "max_symbols": 5}})
+    # 1) parser: ordered unique symbols from the 'Symbol' column, index
+    #    rows and non-constituent tables dropped
+    got = _parse_wiki_constituents(_WIKI_FIXTURE)
+    assert got == ["RELIANCE", "HDFCBANK", "M&M"], got
+    global _fetch_nifty100_nse, _fetch_nifty100_wiki
+    keep = (_fetch_nifty100_nse, _fetch_nifty100_wiki)
+    try:
+        def _boom(timeout=15):
+            raise RuntimeError("blocked")
+        # 2) stale universe + NSE blocked -> Wikipedia succeeds, dead
+        #    symbol is dropped, new one appears, cache written
+        _fetch_nifty100_nse = _boom
+        _fetch_nifty100_wiki = lambda timeout=15: \
+            _parse_wiki_constituents(_WIKI_FIXTURE) + ["NEWGUY"]
+        syms, changed = refresh_universe(cfg, base_dir=d)
+        assert syms == ["RELIANCE", "HDFCBANK", "M&M", "NEWGUY"], syms
+        on_disk = load_universe(ufile)
+        assert on_disk == syms and "DELISTED" not in on_disk
+        with open(os.path.join(d, "universe_cache.json")) as f:
+            cj = json.load(f)
+        assert cj["source"] == "Wikipedia" and cj["symbols"] == syms
+        assert cj["last_attempt"] and cj["updated"]
+        # 3) inside the schedule window -> zero fetches, file untouched
+        calls = {"n": 0}
+        def _count(timeout=15):
+            calls["n"] += 1
+            raise RuntimeError("must not be called")
+        _fetch_nifty100_nse = _fetch_nifty100_wiki = _count
+        syms2, changed2 = refresh_universe(cfg, base_dir=d)
+        assert syms2 == [] and changed2 is False and calls["n"] == 0
+        assert load_universe(ufile) == syms
+        # 4) window elapsed but every source fails -> old file survives
+        with open(os.path.join(d, "universe_cache.json"), "w") as f:
+            json.dump({"last_attempt": "2020-01-01"}, f)
+        _fetch_nifty100_nse = _fetch_nifty100_wiki = _boom
+        syms3, changed3 = refresh_universe(cfg, base_dir=d)
+        assert syms3 == [] and changed3 is False
+        assert load_universe(ufile) == syms
+        # 5) fetched list outside the sanity window is rejected
+        with open(os.path.join(d, "universe_cache.json"), "w") as f:
+            json.dump({"last_attempt": "2020-01-01"}, f)
+        _fetch_nifty100_nse = _boom
+        _fetch_nifty100_wiki = lambda timeout=15: ["TOOSMALL"]
+        syms4, _ = refresh_universe(cfg, base_dir=d)
+        assert syms4 == [] and load_universe(ufile) == syms
+        # 6) disabled flag: no fetch, no change
+        cfg_off = deep_merge(cfg, {"universe_refresh": {"enabled": False}})
+        _fetch_nifty100_wiki = _count
+        syms5, changed5 = refresh_universe(cfg_off, base_dir=d)
+        assert syms5 == [] and changed5 is False and calls["n"] == 0
+    finally:
+        _fetch_nifty100_nse, _fetch_nifty100_wiki = keep
+
+
 SELF_TESTS = [test_config_merge, test_journal_autocreate, test_rsi_atr_helpers,
               test_record_and_dedup, test_long_target_win, test_long_stop_loss,
               test_short_mirror, test_same_bar_conservative_loss,
@@ -2864,8 +3686,10 @@ SELF_TESTS = [test_config_merge, test_journal_autocreate, test_rsi_atr_helpers,
               test_s2_min_stop_gate, test_s1_fib_t01, test_s1_trigger_expiry,
               test_s3_zone_flow, test_s3_bias_structure,
               test_entries_allowed_caps,
+              test_learner_gates, test_signal_window_filter,
               test_auto_poi_h4_and_zones, test_auto_poi_fresh_filter_and_expiry,
-              test_auto_poi_file_roundtrip_and_idempotence]
+              test_auto_poi_file_roundtrip_and_idempotence,
+              test_universe_refresh_flow]
 
 
 def run_selftests():
@@ -2895,8 +3719,8 @@ def main():
         except Exception:
             pass
     ap = argparse.ArgumentParser(description="Intraday scanner v%s - all 3 "
-                                 "SOP strategies + 15:10 auto square-off"
-                                 % VERSION)
+                                 "SOP strategies + self-learning + 15:10 "
+                                 "auto square-off" % VERSION)
     ap.add_argument("--once", action="store_true", help="single scan cycle")
     ap.add_argument("--journal", action="store_true",
                     help="update journal + print report (no scanning)")
