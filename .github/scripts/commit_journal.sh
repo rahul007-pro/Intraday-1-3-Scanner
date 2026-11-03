@@ -5,6 +5,9 @@
 #  * Commits journal/*.csv, journal_state.json and a daily
 #    .heartbeat file (the heartbeat doubles as repo activity
 #    so GitHub never auto-disables the schedule after 60 days).
+#  * Also commits the auto-refreshed NIFTY 100 universe
+#    (universe_nifty100.txt + universe_cache.json, scanner v3.2.1)
+#    so every later run starts with current constituents.
 #  * Handles the rare race where two runs pushed in sequence
 #    by rebasing on top of the remote before pushing.
 #  * No-op (clean exit) when nothing changed.
@@ -21,6 +24,11 @@ mkdir -p journal
 date -u +%F > journal/.heartbeat
 
 git add journal/
+
+# v3.2.1: persist the auto-refreshed NIFTY 100 universe to the repo
+for f in universe_nifty100.txt universe_cache.json; do
+    [ -f "$f" ] && git add "$f"
+done
 
 if git diff --cached --quiet; then
     echo "No journal changes to commit."
