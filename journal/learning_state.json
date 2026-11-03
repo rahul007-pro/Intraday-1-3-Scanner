@@ -1,0 +1,73 @@
+{
+ "as_of": "2026-11-03",
+ "generated_at": "2026-11-03 17:12:20",
+ "config": {
+  "lookback_trades": 30,
+  "recent_trades": 10
+ },
+ "stats": {
+  "overall": {
+   "n": 2,
+   "wins": 1,
+   "losses": 1,
+   "wr": 50.0,
+   "r": -0.19,
+   "avg_r": -0.093
+  },
+  "recent": {
+   "n": 2,
+   "wins": 1,
+   "losses": 1,
+   "wr": 50.0,
+   "r": -0.19,
+   "avg_r": -0.093
+  },
+  "loss_streak": 0,
+  "setups": {
+   "S1": {
+    "n": 2,
+    "wins": 1,
+    "losses": 1,
+    "wr": 50.0,
+    "r": -0.19,
+    "avg_r": -0.093
+   }
+  },
+  "directions": {
+   "LONG": {
+    "n": 2,
+    "wins": 1,
+    "losses": 1,
+    "wr": 50.0,
+    "r": -0.19,
+    "avg_r": -0.093
+   }
+  },
+  "hours": {
+   "13": {
+    "n": 2,
+    "wins": 1,
+    "losses": 1,
+    "wr": 50.0,
+    "r": -0.19,
+    "avg_r": -0.093
+   }
+  },
+  "setup_recent": {
+   "S1": {
+    "n": 2,
+    "wins": 1,
+    "losses": 1,
+    "wr": 50.0,
+    "r": -0.19,
+    "avg_r": -0.093
+   }
+  }
+ },
+ "gates": {
+  "blocked_setups": {},
+  "blocked_directions": {},
+  "preferred": ""
+ },
+ "digest_sent": {}
+}
