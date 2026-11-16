@@ -1,6 +1,6 @@
 {
- "as_of": "2026-11-13",
- "generated_at": "2026-11-13 17:12:56",
+ "as_of": "2026-11-16",
+ "generated_at": "2026-11-16 17:45:09",
  "config": {
   "lookback_trades": 30,
   "recent_trades": 10
